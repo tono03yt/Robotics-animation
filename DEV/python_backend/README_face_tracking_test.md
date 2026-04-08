@@ -1,137 +1,94 @@
-# face_tracking_test.py
+# Real-Time Face Tracking (OpenCV)
 
-TensorFlow-based face tracking app that:
-- reads camera input (laptop webcam or external camera URL),
-- detects faces with MTCNN,
-- draws a green bounding box and confidence label,
-- runs locally in a desktop window,
-- captures camera frames at fixed 480p (`640x480`).
-- keeps display smooth by running detection on a lightweight, rate-limited inference path.
-- now supports an OpenCV-native detector backend for lower-latency tracking.
+This backend script implements real-time face tracking inspired by the OpenCV robotics demo workflow.
 
-## File Location
+File:
+- `DEV/python_backend/face_tracking_test.py`
 
-`DEV/python_backend/face_tracking_test.py`
+What it does:
+- Detects available webcams on startup.
+- Opens a camera-selection window where you choose one connected webcam.
+- Runs real-time face detection and tracks the largest detected face.
+- Displays face-to-center tracking error values that can later be mapped to robot pan/tilt control.
 
-## Requirements
+## Install with `.venv` (Linux)
 
-Recommended setup:
-
-```bash
-# from repository root
-cd DEV/python_backend
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install "opencv-python>=4.9.0" "tensorflow>=2.13.0" "mtcnn>=0.1.1"
-```
-
-If you are already in `DEV/python_backend`, do not run `cd DEV/python_backend` again.
+From project root (`/home/tono03/DEV/Robotics-facial-animation`):
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install "opencv-python>=4.9.0" "tensorflow>=2.13.0" "mtcnn>=0.1.1"
+python -m pip install --upgrade pip
+pip install opencv-python numpy
 ```
+
+Dependencies used:
+- `opencv-python`
+- `numpy`
 
 ## Run
 
-### 1) GUI camera selection mode (recommended)
+From project root:
 
 ```bash
-python face_tracking_test.py --mode gui
+source .venv/bin/activate
+python DEV/python_backend/face_tracking_test.py --mode gui
 ```
 
-- A small GUI opens and lists connected cameras.
-- Select a camera and click `Start`.
-- Tracking opens in an OpenCV window.
+## Useful options
+
+- `--max-cameras 12`
+	- Probe more camera indices during startup scan.
+- `--camera-index 0`
+	- Skip the selection window and use a fixed camera index.
+
+Examples:
+
+```bash
+python DEV/python_backend/face_tracking_test.py --mode gui --max-cameras 12
+python DEV/python_backend/face_tracking_test.py --mode gui --camera-index 0
+```
+
+## Controls
+
+Camera selection window:
+- Native OS dialog opens with a camera list.
+- Double-click camera or select one and press `Open`.
+- Press `Cancel` to exit.
+
+Tracking window:
 - Press `q` or `ESC` to quit.
 
-### 2) Local mode with fixed webcam index
+## Good Practice Note
+
+Current approach is good for a lightweight prototype and fast local testing.
+
+To make it better practice for production robotics use:
+- Replace Haar cascades with a DNN face detector for higher robustness.
+- Add camera warm-up/retry logic and structured logging.
+- Separate vision tracking output from robot control into clear modules.
+
+## Troubleshooting (Linux)
+
+If you saw warnings like:
+- `Camera index out of range`
+- `Ignoring XDG_SESSION_TYPE=wayland`
+- `QFontDatabase: Cannot find font directory ... cv2/qt/fonts`
+
+What they mean and what changed:
+- `Camera index out of range`
+	- Usually caused by probing non-existing camera indices.
+	- Script now uses `/dev/video*` discovery first, which is better practice on Linux and reduces noisy probes.
+- Wayland/X11 warning
+	- OpenCV Qt windows often run with XCB by default.
+	- Script now sets `QT_QPA_PLATFORM=xcb` by default to avoid backend ambiguity.
+- Qt font directory warning
+	- Some OpenCV wheels do not bundle Qt fonts.
+	- Script now sets `QT_QPA_FONTDIR` to system font directories when available.
+
+If GUI still fails, install system fonts once:
 
 ```bash
-python face_tracking_test.py --mode local --camera-index 0
+sudo apt update
+sudo apt install -y fonts-dejavu-core
 ```
-
-### 3) Local mode with external camera URL
-
-```bash
-python face_tracking_test.py --mode local --camera-url "http://<camera-ip>:<port>/video"
-```
-
-RTSP example:
-
-```bash
-python face_tracking_test.py --mode local --camera-url "rtsp://user:pass@<camera-ip>:554/stream"
-```
-
-## Useful Flags
-
-- `--mode` : `gui` or `local` (default `gui`)
-- `--camera-index` : webcam index (default `0`)
-- `--camera-url` : external camera URL; overrides camera index
-- `--min-confidence` : minimum face confidence for drawing boxes (default `0.90`)
-- `--probe-max-index` : max camera index to scan in GUI mode (default `8`)
-- `--detect-width` : width used for face inference (default `320`, lower is faster)
-- `--detect-interval-ms` : minimum delay between detections (default `45`, higher is smoother/lower CPU)
-- `--detector-backend` : `opencv` (fast default) or `mtcnn` (higher accuracy, slower)
-- `--bbox-smoothing` : box smoothing factor `0.0-0.95` (default `0.45`)
-- `--hold-last-ms` : keeps last valid box briefly through misses (default `250`)
-- `--max-missed-detections` : tolerated missed detections before hide (default `5`)
-
-## Real-Time Tuning
-
-For maximum smoothness on weaker hardware:
-
-```bash
-python face_tracking_test.py --mode local --camera-index 0 --detector-backend opencv --detect-width 256 --detect-interval-ms 55 --bbox-smoothing 0.55
-```
-
-If detection still flickers, increase persistence:
-
-```bash
-python face_tracking_test.py --mode local --camera-index 0 --detector-backend opencv --hold-last-ms 350 --max-missed-detections 8 --bbox-smoothing 0.60
-```
-
-For better detection precision on stronger hardware:
-
-```bash
-python face_tracking_test.py --mode local --camera-index 0 --detector-backend mtcnn --detect-width 384 --detect-interval-ms 30 --bbox-smoothing 0.35
-```
-
-## Comparison With OpenCV Example
-
-Compared with the OpenCV UR face-tracking example, this script now adopts the same speed-first principles:
-
-- OpenCV-first detection path (`--detector-backend opencv`) for low latency
-- continuous closed-loop updates using latest-frame semantics (drop stale frames)
-- center-offset feedback (`dx`, `dy`) from frame center to face center
-- smoothing to reduce jitter and improve visual stability
-
-Main difference:
-
-- this project tracks in a local camera window only (no robot control mapping)
-
-## Troubleshooting
-
-- Camera does not open:
-  - try another `--camera-index` (`0`, `1`, `2`)
-  - verify no other app is using the webcam
-  - test your external URL in VLC/ffplay first
-- `ModuleNotFoundError: No module named 'cv2'`:
-  - install dependencies in the same interpreter you use to run:
-  - `python -m pip install "opencv-python>=4.9.0" "tensorflow>=2.13.0" "mtcnn>=0.1.1"`
-- Tracking window lags:
-  - 480p is already fixed; close other camera-heavy apps and reduce background load
-- No boxes detected:
-  - improve lighting
-  - move closer to camera
-  - reduce threshold, for example `--min-confidence 0.75`
-
-## Good Practice Notes
-
-Current implementation is good for prototyping and local testing.
-For production-grade deployment, improve by:
-- pinning dependency versions exactly (for reproducibility)
-- adding structured logging and health checks
-- separating capture, inference, and GUI into independent components
-- adding tests for argument parsing and camera probing
