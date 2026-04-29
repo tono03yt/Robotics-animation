@@ -15,5 +15,8 @@ __pycache__/
 .env
 .env.*
 
-python models
+#python models
 .models
+
+#api keys
+api_key_openrouterai

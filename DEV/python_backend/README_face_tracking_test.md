@@ -77,6 +77,30 @@ python DEV/python_backend/face_tracking_test.py --serial-port /dev/ttyUSB0
 python DEV/python_backend/face_tracking_test.py --camera-index 0 --serial-port /dev/ttyUSB0 --serial-baudrate 115200
 ```
 
+## Serial I/O Test Client
+
+Use this standalone helper to test the same serial protocol without running the full camera pipeline:
+
+- File: [DEV/python_backend/serial_io_test_client.py](DEV/python_backend/serial_io_test_client.py)
+- Purpose: send manual `SERVO`, `PLAY`, and `REC` commands and print incoming `AUDIO` / `STAT` / debug lines.
+
+Run it from the project root:
+
+```bash
+python DEV/python_backend/serial_io_test_client.py --list-ports
+python DEV/python_backend/serial_io_test_client.py --port /dev/ttyUSB0
+```
+
+Interactive commands inside the client:
+- `servo <x_error> [confidence]`
+- `play <duration_ms> <sample_rate> <hex_audio_data>`
+- `rec start|stop`
+- `raw <message>`
+- `demo`
+- `ports`
+
+This is the best practice for protocol debugging because it isolates serial communication from the vision loop and makes it easier to verify Arduino firmware before connecting the camera tracker.
+
 ## Arduino Integration
 
 The script includes two classes for communicating with Arduino Nano:
