@@ -199,7 +199,7 @@ def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]
 
 	resolution_row = tk.Frame(settings_frame)
 	resolution_row.pack(fill="x")
-	tk = None
+	ttk = None
 	try:
 		from tkinter import ttk
 	except Exception:
