@@ -93,6 +93,9 @@ class CameraSelection:
 	camera: CameraInfo
 	resolution: Tuple[int, int]
 	model_selection: int
+	serial_port: Optional[str] = None
+	enable_servo: bool = False
+	enable_audio: bool = False
 
 
 RESOLUTION_PRESETS: List[Tuple[str, Tuple[int, int]]] = [
@@ -101,6 +104,30 @@ RESOLUTION_PRESETS: List[Tuple[str, Tuple[int, int]]] = [
 	("1920 x 1080", (1920, 1080)),
 	("320 x 240", (320, 240)),
 ]
+
+
+def detect_serial_ports() -> List[str]:
+	"""Detect available serial ports on Linux."""
+	ports: List[str] = []
+	try:
+		if os.name == "posix":
+			for path in Path("/dev").glob("tty*"):
+				if "USB" in path.name or "ACM" in path.name or path.name.startswith("ttyS"):
+					ports.append(str(path))
+		ports.sort()
+		return ports
+	except Exception:
+		return []
+
+
+def get_serial_port_label(port: str) -> str:
+	"""Get a friendly label for a serial port."""
+	if "USB" in port:
+		return f"{port} (USB)"
+	elif "ACM" in port:
+		return f"{port} (Nano)"
+	else:
+		return port
 
 
 class SerialController:
@@ -328,7 +355,7 @@ def discover_cameras(max_cameras: int = 10) -> List[CameraInfo]:
 
 
 def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]:
-	"""Open a native OS dialog and let user select a camera and capture settings."""
+	"""Open a native OS dialog and let user select a camera, features, and connection settings."""
 	try:
 		import tkinter as tk
 		from tkinter import messagebox
@@ -362,33 +389,42 @@ def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]
 	selected_index = {"value": None}
 	selected_resolution = {"value": RESOLUTION_PRESETS[1][1]}
 	model_state = {"value": 0}
+	selected_serial_port = {"value": None}
+	enable_servo_state = {"value": False}
+	enable_audio_state = {"value": False}
+
+	# Detect available serial ports
+	available_ports = detect_serial_ports()
+	port_labels = ["None (Tracking only)"] + [get_serial_port_label(p) for p in available_ports]
+	port_values = [None] + available_ports
 
 	root = tk.Tk()
-	root.title("Select Webcam")
+	root.title("Select Webcam and Features")
 	root.resizable(False, False)
-	root.geometry("620x430")
+	root.geometry("680x650")
 
 	frame = tk.Frame(root, padx=12, pady=12)
 	frame.pack(fill="both", expand=True)
 
 	title_label = tk.Label(
 		frame,
-		text="Select webcam for face tracking",
+		text="Face Tracking Setup",
 		font=("DejaVu Sans", 11, "bold"),
 	)
 	title_label.pack(anchor="w")
 
 	subtitle_label = tk.Label(
 		frame,
-		text="Choose a camera, resolution, and face detection distance mode.",
+		text="Configure camera, resolution, and optional features.",
 		font=("DejaVu Sans", 9),
 	)
 	subtitle_label.pack(anchor="w", pady=(4, 8))
 
-	settings_frame = tk.LabelFrame(frame, text="Start-up settings", padx=10, pady=10)
-	settings_frame.pack(fill="x", pady=(0, 10))
+	# Camera settings section
+	camera_frame = tk.LabelFrame(frame, text="Camera Settings", padx=10, pady=10)
+	camera_frame.pack(fill="x", pady=(0, 10))
 
-	resolution_row = tk.Frame(settings_frame)
+	resolution_row = tk.Frame(camera_frame)
 	resolution_row.pack(fill="x")
 	ttk = None
 	try:
@@ -404,7 +440,7 @@ def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]
 	resolution_menu = tk.OptionMenu(resolution_row, resolution_var, *resolution_names)
 	resolution_menu.pack(side="left", padx=(8, 0))
 
-	model_row = tk.Frame(settings_frame)
+	model_row = tk.Frame(camera_frame)
 	model_row.pack(fill="x", pady=(10, 0))
 
 	model_label = tk.Label(model_row, text="Distance mode:")
@@ -429,13 +465,71 @@ def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]
 	resolution_var.trace_add("write", lambda *_args: sync_resolution())
 	sync_resolution()
 
+	# Arduino / Serial settings section
+	features_frame = tk.LabelFrame(frame, text="Optional Features", padx=10, pady=10)
+	features_frame.pack(fill="x", pady=(0, 10))
+
+	# Serial port selector
+	serial_row = tk.Frame(features_frame)
+	serial_row.pack(fill="x")
+
+	serial_label = tk.Label(serial_row, text="Serial Port:")
+	serial_label.pack(side="left")
+
+	serial_var = tk.StringVar(value=port_labels[0])
+	serial_menu = tk.OptionMenu(serial_row, serial_var, *port_labels)
+	serial_menu.pack(side="left", padx=(8, 0))
+
+	def sync_serial_port() -> None:
+		choice = serial_var.get()
+		for i, label in enumerate(port_labels):
+			if label == choice:
+				selected_serial_port["value"] = port_values[i]
+				return
+
+	serial_var.trace_add("write", lambda *_args: sync_serial_port())
+	sync_serial_port()
+
+	# Feature toggles
+	servo_row = tk.Frame(features_frame)
+	servo_row.pack(fill="x", pady=(10, 0))
+
+	servo_button_text = tk.StringVar(value="Servo Control: OFF")
+	servo_button = tk.Button(servo_row, textvariable=servo_button_text, width=20, bg="#ffcccc")
+	servo_button.pack(side="left")
+
+	def toggle_servo() -> None:
+		enable_servo_state["value"] = not enable_servo_state["value"]
+		servo_button_text.set("Servo Control: ON" if enable_servo_state["value"] else "Servo Control: OFF")
+		servo_button.config(bg="#ccffcc" if enable_servo_state["value"] else "#ffcccc")
+
+	servo_button.configure(command=toggle_servo)
+
+	audio_row = tk.Frame(features_frame)
+	audio_row.pack(fill="x", pady=(5, 0))
+
+	audio_button_text = tk.StringVar(value="Audio Recognition: OFF")
+	audio_button = tk.Button(audio_row, textvariable=audio_button_text, width=20, bg="#ffcccc")
+	audio_button.pack(side="left")
+
+	def toggle_audio() -> None:
+		enable_audio_state["value"] = not enable_audio_state["value"]
+		audio_button_text.set("Audio Recognition: ON" if enable_audio_state["value"] else "Audio Recognition: OFF")
+		audio_button.config(bg="#ccffcc" if enable_audio_state["value"] else "#ffcccc")
+
+	audio_button.configure(command=toggle_audio)
+
+	# Camera list
+	list_label = tk.Label(frame, text="Available Cameras:", font=("DejaVu Sans", 9, "bold"))
+	list_label.pack(anchor="w", pady=(8, 4))
+
 	list_frame = tk.Frame(frame)
 	list_frame.pack(fill="both", expand=True)
 
 	scrollbar = tk.Scrollbar(list_frame, orient="vertical")
 	listbox = tk.Listbox(
 		list_frame,
-		height=10,
+		height=8,
 		exportselection=False,
 		yscrollcommand=scrollbar.set,
 		font=("DejaVu Sans", 10),
@@ -483,6 +577,9 @@ def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]
 			camera=cameras[idx],
 			resolution=selected_resolution["value"],
 			model_selection=model_state["value"],
+			serial_port=selected_serial_port["value"],
+			enable_servo=enable_servo_state["value"],
+			enable_audio=enable_audio_state["value"],
 		)
 	return None
 
@@ -548,6 +645,8 @@ def run_face_tracking(
 	target_resolution: Optional[Tuple[int, int]] = None,
 	serial_port: Optional[str] = None,
 	serial_baudrate: int = 115200,
+	enable_servo: bool = False,
+	enable_audio: bool = False,
 ) -> None:
 	"""Run the real-time face tracking loop.
 	
@@ -556,8 +655,10 @@ def run_face_tracking(
 	    model_selection: MediaPipe model (0=short-range, 1=full-range).
 	    min_detection_confidence: Minimum confidence for face detection.
 	    target_resolution: Optional (width, height) to set on camera.
-	    serial_port: Optional serial port path (e.g. /dev/ttyUSB0). If None, servo control disabled.
+	    serial_port: Optional serial port path (e.g. /dev/ttyUSB0).
 	    serial_baudrate: Serial baud rate (default 115200).
+	    enable_servo: If True, send servo commands to Arduino.
+	    enable_audio: If True, start background audio I/O handler.
 	"""
 	cap = open_camera(camera_index)
 	if not cap.isOpened():
@@ -568,6 +669,28 @@ def run_face_tracking(
 		cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
 		cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
 		cap.set(cv2.CAP_PROP_FPS, 30.0)
+
+	# Initialize optional serial controller for servo commands
+	serial_ctrl: Optional[SerialController] = None
+	audio_handler: Optional[AudioHandler] = None
+	
+	if enable_servo or enable_audio:
+		if not serial_port:
+			print("[run_face_tracking] Warning: Features enabled but no serial port selected. Features disabled.")
+		else:
+			try:
+				serial_ctrl = SerialController(port=serial_port, baudrate=serial_baudrate)
+				if not serial_ctrl.connect():
+					print(f"[run_face_tracking] Warning: Could not connect to {serial_port}, features disabled.")
+					serial_ctrl = None
+				else:
+					if enable_audio:
+						audio_handler = AudioHandler(serial_ctrl)
+						audio_handler.start()
+						print("[run_face_tracking] Audio handler started")
+			except Exception as e:
+				print(f"[run_face_tracking] Warning: Serial init failed: {e}, features disabled.")
+				serial_ctrl = None
 
 	window_name = f"Face Tracking - Camera {camera_index}"
 	window_open = False
@@ -625,6 +748,10 @@ def run_face_tracking(
 					2,
 					cv2.LINE_AA,
 				)
+
+				# Send X error to Arduino for servo control (if enabled)
+				if enable_servo and serial_ctrl:
+					serial_ctrl.send_servo_command(err_x, confidence=score)
 			else:
 				cv2.putText(
 					frame,
@@ -636,6 +763,10 @@ def run_face_tracking(
 					2,
 					cv2.LINE_AA,
 				)
+
+				# Send zero error when no face detected (if servo enabled)
+				if enable_servo and serial_ctrl:
+					serial_ctrl.send_servo_command(0.0, confidence=0.0)
 
 			now = time.time()
 			fps = 1.0 / max(1e-6, now - prev)
@@ -661,6 +792,10 @@ def run_face_tracking(
 			detector.close()
 		if window_open:
 			cv2.destroyWindow(window_name)
+		if audio_handler:
+			audio_handler.stop()
+		if serial_ctrl:
+			serial_ctrl.disconnect()
 
 
 def parse_args() -> argparse.Namespace:
@@ -690,6 +825,18 @@ def parse_args() -> argparse.Namespace:
 		default=0.5,
 		help="Minimum confidence required for a face detection.",
 	)
+	parser.add_argument(
+		"--serial-port",
+		type=str,
+		default=None,
+		help="Serial port path for Arduino communication (e.g. /dev/ttyUSB0). If not set, servo control is disabled.",
+	)
+	parser.add_argument(
+		"--serial-baudrate",
+		type=int,
+		default=115200,
+		help="Baud rate for serial communication (default 115200).",
+	)
 	return parser.parse_args()
 
 
@@ -709,16 +856,26 @@ def main() -> None:
 		cam_index = selected.camera.index
 		model_selection = selected.model_selection
 		target_resolution = selected.resolution
+		serial_port = selected.serial_port
+		enable_servo = selected.enable_servo
+		enable_audio = selected.enable_audio
 	else:
 		cam_index = args.camera_index
 		model_selection = args.model_selection
 		target_resolution = None
+		serial_port = args.serial_port
+		enable_servo = args.serial_port is not None  # Enable servo if serial port specified via CLI
+		enable_audio = False  # Audio must be explicitly enabled via GUI for now
 
 	run_face_tracking(
 		camera_index=cam_index,
 		model_selection=model_selection,
 		min_detection_confidence=args.min_detection_confidence,
 		target_resolution=target_resolution,
+		serial_port=serial_port,
+		serial_baudrate=args.serial_baudrate,
+		enable_servo=enable_servo,
+		enable_audio=enable_audio,
 	)
 	cv2.destroyAllWindows()
 
