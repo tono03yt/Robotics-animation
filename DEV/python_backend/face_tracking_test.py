@@ -15,8 +15,16 @@ import sys
 import site
 from pathlib import Path
 import time
+import struct
+import threading
+import queue
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
+
+try:
+	import serial
+except ImportError:
+	serial = None  # Will warn at runtime if serial is needed
 
 # OpenCV HighGUI uses Qt in many Linux wheels. Set sensible defaults before
 # importing cv2 to avoid repeated runtime warnings in common desktop setups.
@@ -93,6 +101,189 @@ RESOLUTION_PRESETS: List[Tuple[str, Tuple[int, int]]] = [
 	("1920 x 1080", (1920, 1080)),
 	("320 x 240", (320, 240)),
 ]
+
+
+class SerialController:
+	"""Manages bidirectional serial communication with Arduino for servo control and telemetry."""
+
+	def __init__(
+		self,
+		port: str = "/dev/ttyUSB0",
+		baudrate: int = 115200,
+		timeout: float = 1.0,
+	) -> None:
+		"""Initialize serial controller (does not connect yet)."""
+		if serial is None:
+			raise RuntimeError("pyserial is not installed. Install with: pip install pyserial")
+		self.port = port
+		self.baudrate = baudrate
+		self.timeout = timeout
+		self.ser: Optional[Any] = None
+		self.connected = False
+
+	def connect(self) -> bool:
+		"""Open serial connection to Arduino."""
+		try:
+			self.ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
+			time.sleep(0.5)  # Give Arduino time to reset
+			self.connected = True
+			print(f"[SerialController] Connected to {self.port} at {self.baudrate} baud")
+			return True
+		except Exception as e:
+			print(f"[SerialController] Failed to connect: {e}")
+			self.connected = False
+			return False
+
+	def disconnect(self) -> None:
+		"""Close serial connection."""
+		if self.ser and self.ser.is_open:
+			self.ser.close()
+			self.connected = False
+			print("[SerialController] Disconnected")
+
+	def send_servo_command(self, x_error: float, confidence: Optional[float] = None) -> bool:
+		"""Send servo command to Arduino: SERVO,<X_error>,<confidence>
+		
+		Args:
+		    x_error: Normalized error (-1.0 to +1.0, where 0 = centered)
+		    confidence: Optional detection confidence (0.0 to 1.0)
+		
+		Returns:
+		    True if sent successfully, False otherwise.
+		"""
+		if not self.connected or not self.ser:
+			return False
+		try:
+			if confidence is not None:
+				msg = f"SERVO,{x_error:.4f},{confidence:.2f}\n"
+			else:
+				msg = f"SERVO,{x_error:.4f}\n"
+			self.ser.write(msg.encode("utf-8"))
+			return True
+		except Exception as e:
+			print(f"[SerialController] Error sending servo: {e}")
+			self.connected = False
+			return False
+
+	def send_raw(self, data: str) -> bool:
+		"""Send raw string command to Arduino."""
+		if not self.connected or not self.ser:
+			return False
+		try:
+			self.ser.write((data + "\n").encode("utf-8"))
+			return True
+		except Exception as e:
+			print(f"[SerialController] Error sending raw: {e}")
+			self.connected = False
+			return False
+
+	def read_line(self, timeout: Optional[float] = None) -> Optional[str]:
+		"""Read one line from serial (blocking until newline or timeout)."""
+		if not self.connected or not self.ser:
+			return None
+		try:
+			old_timeout = self.ser.timeout
+			if timeout is not None:
+				self.ser.timeout = timeout
+			line = self.ser.readline().decode("utf-8").strip()
+			self.ser.timeout = old_timeout
+			return line if line else None
+		except Exception as e:
+			print(f"[SerialController] Error reading: {e}")
+			self.connected = False
+			return None
+
+
+class AudioHandler:
+	"""Handles receive/send of audio data from/to Arduino via serial in background threads."""
+
+	def __init__(self, serial_controller: SerialController) -> None:
+		"""Initialize audio handler (linked to a SerialController)."""
+		self.serial_controller = serial_controller
+		self.recv_queue: queue.Queue[str] = queue.Queue()
+		self.send_queue: queue.Queue[str] = queue.Queue()
+		self.recv_thread: Optional[threading.Thread] = None
+		self.send_thread: Optional[threading.Thread] = None
+		self.running = False
+
+	def start(self) -> None:
+		"""Start background receive and send threads."""
+		self.running = True
+		self.recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
+		self.send_thread = threading.Thread(target=self._send_loop, daemon=True)
+		self.recv_thread.start()
+		self.send_thread.start()
+		print("[AudioHandler] Started receive/send threads")
+
+	def stop(self) -> None:
+		"""Stop background threads."""
+		self.running = False
+		if self.recv_thread:
+			self.recv_thread.join(timeout=1.0)
+		if self.send_thread:
+			self.send_thread.join(timeout=1.0)
+		print("[AudioHandler] Stopped threads")
+
+	def _recv_loop(self) -> None:
+		"""Background loop: receive audio/telemetry from Arduino."""
+		buffer = b""
+		while self.running:
+			try:
+				if self.serial_controller.ser and self.serial_controller.ser.in_waiting > 0:
+					chunk = self.serial_controller.ser.read(self.serial_controller.ser.in_waiting)
+					buffer += chunk
+
+					# Parse complete messages ending with \n
+					while b"\n" in buffer:
+						msg_bytes, buffer = buffer.split(b"\n", 1)
+						try:
+							msg = msg_bytes.decode("utf-8").strip()
+							if msg:
+								self.recv_queue.put(msg)
+						except UnicodeDecodeError as e:
+							print(f"[AudioHandler] Decode error: {e}")
+				time.sleep(0.001)
+			except Exception as e:
+				print(f"[AudioHandler] Receive loop error: {e}")
+				time.sleep(0.1)
+
+	def _send_loop(self) -> None:
+		"""Background loop: send queued audio/commands to Arduino."""
+		while self.running:
+			try:
+				msg = self.send_queue.get(timeout=0.1)
+				if self.serial_controller.ser and self.serial_controller.connected:
+					self.serial_controller.ser.write((msg + "\n").encode("utf-8"))
+			except queue.Empty:
+				pass
+			except Exception as e:
+				print(f"[AudioHandler] Send loop error: {e}")
+				time.sleep(0.1)
+
+	def queue_audio_to_send(self, audio_type: str, data: str) -> None:
+		"""Queue audio command to send to Arduino.
+		
+		Args:
+		    audio_type: Command type (e.g. "PLAY" for playback, "REC" for recording start)
+		    data: Payload (e.g. hex-encoded audio samples or command flags)
+		"""
+		msg = f"{audio_type},{data}"
+		self.send_queue.put(msg)
+
+	def get_received_message(self, block: bool = False, timeout: Optional[float] = None) -> Optional[str]:
+		"""Retrieve next received audio/telemetry message from Arduino.
+		
+		Returns:
+		    String message (e.g. "AUDIO,<samples>") or None if queue empty/timeout.
+		"""
+		try:
+			return self.recv_queue.get(block=block, timeout=timeout)
+		except queue.Empty:
+			return None
+
+	def queue_size(self) -> int:
+		"""Return number of pending received messages."""
+		return self.recv_queue.qsize()
 
 
 def list_linux_video_indices(max_cameras: int) -> List[int]:
@@ -355,8 +546,19 @@ def run_face_tracking(
 	model_selection: int,
 	min_detection_confidence: float,
 	target_resolution: Optional[Tuple[int, int]] = None,
+	serial_port: Optional[str] = None,
+	serial_baudrate: int = 115200,
 ) -> None:
-	"""Run the real-time face tracking loop."""
+	"""Run the real-time face tracking loop.
+	
+	Args:
+	    camera_index: Camera device index to open.
+	    model_selection: MediaPipe model (0=short-range, 1=full-range).
+	    min_detection_confidence: Minimum confidence for face detection.
+	    target_resolution: Optional (width, height) to set on camera.
+	    serial_port: Optional serial port path (e.g. /dev/ttyUSB0). If None, servo control disabled.
+	    serial_baudrate: Serial baud rate (default 115200).
+	"""
 	cap = open_camera(camera_index)
 	if not cap.isOpened():
 		raise RuntimeError(f"Could not open camera {camera_index}")
