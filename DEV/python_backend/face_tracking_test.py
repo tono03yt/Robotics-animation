@@ -1,9 +1,11 @@
-"""Real-time face tracking using OpenCV + MediaPipe.
+#!/usr/bin/env python3
+"""Real-time face tracking that sends position vectors over serial USB.
 
-Features:
-- Discover connected webcams.
-- Startup camera selection window.
-- Real-time MediaPipe face detection and tracking visualization.
+The backend detects the largest face and streams a packet like:
+
+    POS,<x_error>,<y_error>,<confidence>\n
+This is meant for an Arduino Nano that drives servos from the received
+normalized position vector.
 """
 
 from __future__ import annotations
@@ -11,68 +13,59 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import sys
 import site
-from pathlib import Path
+import sys
 import time
-import struct
-import threading
-import queue
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 try:
-	import serial
+    import serial
 except ImportError:
-	serial = None  # Will warn at runtime if serial is needed
+    serial = None
 
-# OpenCV HighGUI uses Qt in many Linux wheels. Set sensible defaults before
-# importing cv2 to avoid repeated runtime warnings in common desktop setups.
 if os.name == "posix":
-	os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
-	os.environ.setdefault("PYTHONNOUSERSITE", "1")
-	if "QT_QPA_FONTDIR" not in os.environ:
-		for font_dir in (
-			"/usr/share/fonts/truetype/dejavu",
-			"/usr/share/fonts/truetype",
-			"/usr/share/fonts",
-		):
-			if os.path.isdir(font_dir):
-				os.environ["QT_QPA_FONTDIR"] = font_dir
-				break
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+    os.environ.setdefault("PYTHONNOUSERSITE", "1")
+    if "QT_QPA_FONTDIR" not in os.environ:
+        for font_dir in (
+            "/usr/share/fonts/truetype/dejavu",
+            "/usr/share/fonts/truetype",
+            "/usr/share/fonts",
+        ):
+            if os.path.isdir(font_dir):
+                os.environ["QT_QPA_FONTDIR"] = font_dir
+                break
 
 
 def _remove_user_site_from_path() -> None:
-	"""Avoid importing broken packages from the user's site-packages directory."""
-	try:
-		user_site = Path(site.getusersitepackages()).resolve()
-	except Exception:
-		return
+    try:
+        user_site = Path(site.getusersitepackages()).resolve()
+    except Exception:
+        return
 
-	filtered: List[str] = []
-	for entry in sys.path:
-		try:
-			resolved = Path(entry).resolve()
-		except Exception:
-			filtered.append(entry)
-			continue
-		if resolved == user_site or str(resolved).startswith(str(user_site)):
-			continue
-		filtered.append(entry)
-	sys.path[:] = filtered
+    filtered: List[str] = []
+    for entry in sys.path:
+        try:
+            resolved = Path(entry).resolve()
+        except Exception:
+            filtered.append(entry)
+            continue
+        if resolved == user_site or str(resolved).startswith(str(user_site)):
+            continue
+        filtered.append(entry)
+    sys.path[:] = filtered
 
 
 def _bootstrap_project_venv() -> None:
-	"""Relaunch with the local project venv when not already running inside it."""
-	if ".venv" in Path(sys.executable).parts:
-		return
-
-	venv_python = Path(__file__).resolve().parent / ".venv" / "bin" / "python"
-	if not venv_python.exists():
-		return
-
-	os.environ.setdefault("PYTHONNOUSERSITE", "1")
-	os.execv(str(venv_python), [str(venv_python), *sys.argv])
+    if ".venv" in Path(sys.executable).parts:
+        return
+    venv_python = Path(__file__).resolve().parent / ".venv" / "bin" / "python"
+    if not venv_python.exists():
+        return
+    os.environ.setdefault("PYTHONNOUSERSITE", "1")
+    os.execv(str(venv_python), [str(venv_python), *sys.argv])
 
 
 _remove_user_site_from_path()
@@ -83,802 +76,455 @@ import cv2
 
 @dataclass
 class CameraInfo:
-	index: int
-	width: int
-	height: int
+    index: int
+    width: int
+    height: int
 
 
 @dataclass
 class CameraSelection:
-	camera: CameraInfo
-	resolution: Tuple[int, int]
-	model_selection: int
-	serial_port: Optional[str] = None
-	enable_servo: bool = False
-	enable_audio: bool = False
+    camera: CameraInfo
+    resolution: Tuple[int, int]
+    model_selection: int
+    serial_port: Optional[str] = None
+    serial_baudrate: int = 115200
 
 
 RESOLUTION_PRESETS: List[Tuple[str, Tuple[int, int]]] = [
-	("640 x 480", (640, 480)),
-	("1280 x 720", (1280, 720)),
-	("1920 x 1080", (1920, 1080)),
-	("320 x 240", (320, 240)),
+    ("640 x 480", (640, 480)),
+    ("1280 x 720", (1280, 720)),
+    ("1920 x 1080", (1920, 1080)),
+    ("320 x 240", (320, 240)),
 ]
 
 
 def detect_serial_ports() -> List[str]:
-	"""Detect available serial ports on Linux."""
-	ports: List[str] = []
-	try:
-		if os.name == "posix":
-			for path in Path("/dev").glob("tty*"):
-				if "USB" in path.name or "ACM" in path.name or path.name.startswith("ttyS"):
-					ports.append(str(path))
-		ports.sort()
-		return ports
-	except Exception:
-		return []
+    ports: List[str] = []
+    for pattern in ("ttyUSB*", "ttyACM*", "ttyS*"):
+        for path in Path("/dev").glob(pattern):
+            ports.append(str(path))
+    for path in Path("/dev/pts").glob("*"):
+        if path.name.isdigit():
+            ports.append(str(path))
+    return sorted(set(ports))
 
 
 def get_serial_port_label(port: str) -> str:
-	"""Get a friendly label for a serial port."""
-	if "USB" in port:
-		return f"{port} (USB)"
-	elif "ACM" in port:
-		return f"{port} (Nano)"
-	else:
-		return port
+    if "USB" in port:
+        return f"{port} (USB)"
+    if "ACM" in port:
+        return f"{port} (Nano)"
+    return port
 
 
 class SerialController:
-	"""Manages bidirectional serial communication with Arduino for servo control and telemetry."""
+    def __init__(self, port: str = "/dev/ttyUSB0", baudrate: int = 115200, timeout: float = 1.0) -> None:
+        if serial is None:
+            raise RuntimeError("pyserial is not installed. Install with: pip install pyserial")
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self.ser: Optional[Any] = None
+        self.connected = False
 
-	def __init__(
-		self,
-		port: str = "/dev/ttyUSB0",
-		baudrate: int = 115200,
-		timeout: float = 1.0,
-	) -> None:
-		"""Initialize serial controller (does not connect yet)."""
-		if serial is None:
-			raise RuntimeError("pyserial is not installed. Install with: pip install pyserial")
-		self.port = port
-		self.baudrate = baudrate
-		self.timeout = timeout
-		self.ser: Optional[Any] = None
-		self.connected = False
+    def connect(self) -> bool:
+        try:
+            self.ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
+            time.sleep(0.5)
+            self.connected = True
+            print(f"[SerialController] Connected to {self.port} at {self.baudrate} baud")
+            return True
+        except Exception as exc:
+            print(f"[SerialController] Failed to connect: {exc}")
+            self.connected = False
+            return False
 
-	def connect(self) -> bool:
-		"""Open serial connection to Arduino."""
-		try:
-			self.ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
-			time.sleep(0.5)  # Give Arduino time to reset
-			self.connected = True
-			print(f"[SerialController] Connected to {self.port} at {self.baudrate} baud")
-			return True
-		except Exception as e:
-			print(f"[SerialController] Failed to connect: {e}")
-			self.connected = False
-			return False
+    def disconnect(self) -> None:
+        if self.ser and getattr(self.ser, "is_open", False):
+            try:
+                self.ser.close()
+            finally:
+                self.connected = False
+                print("[SerialController] Disconnected")
 
-	def disconnect(self) -> None:
-		"""Close serial connection."""
-		if self.ser and self.ser.is_open:
-			self.ser.close()
-			self.connected = False
-			print("[SerialController] Disconnected")
-
-	def send_servo_command(self, x_error: float, confidence: Optional[float] = None) -> bool:
-		"""Send servo command to Arduino: SERVO,<X_error>,<confidence>
-		
-		Args:
-		    x_error: Normalized error (-1.0 to +1.0, where 0 = centered)
-		    confidence: Optional detection confidence (0.0 to 1.0)
-		
-		Returns:
-		    True if sent successfully, False otherwise.
-		"""
-		if not self.connected or not self.ser:
-			return False
-		try:
-			if confidence is not None:
-				msg = f"SERVO,{x_error:.4f},{confidence:.2f}\n"
-			else:
-				msg = f"SERVO,{x_error:.4f}\n"
-			self.ser.write(msg.encode("utf-8"))
-			return True
-		except Exception as e:
-			print(f"[SerialController] Error sending servo: {e}")
-			self.connected = False
-			return False
-
-	def send_raw(self, data: str) -> bool:
-		"""Send raw string command to Arduino."""
-		if not self.connected or not self.ser:
-			return False
-		try:
-			self.ser.write((data + "\n").encode("utf-8"))
-			return True
-		except Exception as e:
-			print(f"[SerialController] Error sending raw: {e}")
-			self.connected = False
-			return False
-
-	def read_line(self, timeout: Optional[float] = None) -> Optional[str]:
-		"""Read one line from serial (blocking until newline or timeout)."""
-		if not self.connected or not self.ser:
-			return None
-		try:
-			old_timeout = self.ser.timeout
-			if timeout is not None:
-				self.ser.timeout = timeout
-			line = self.ser.readline().decode("utf-8").strip()
-			self.ser.timeout = old_timeout
-			return line if line else None
-		except Exception as e:
-			print(f"[SerialController] Error reading: {e}")
-			self.connected = False
-			return None
-
-
-class AudioHandler:
-	"""Handles receive/send of audio data from/to Arduino via serial in background threads."""
-
-	def __init__(self, serial_controller: SerialController) -> None:
-		"""Initialize audio handler (linked to a SerialController)."""
-		self.serial_controller = serial_controller
-		self.recv_queue: queue.Queue[str] = queue.Queue()
-		self.send_queue: queue.Queue[str] = queue.Queue()
-		self.recv_thread: Optional[threading.Thread] = None
-		self.send_thread: Optional[threading.Thread] = None
-		self.running = False
-
-	def start(self) -> None:
-		"""Start background receive and send threads."""
-		self.running = True
-		self.recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
-		self.send_thread = threading.Thread(target=self._send_loop, daemon=True)
-		self.recv_thread.start()
-		self.send_thread.start()
-		print("[AudioHandler] Started receive/send threads")
-
-	def stop(self) -> None:
-		"""Stop background threads."""
-		self.running = False
-		if self.recv_thread:
-			self.recv_thread.join(timeout=1.0)
-		if self.send_thread:
-			self.send_thread.join(timeout=1.0)
-		print("[AudioHandler] Stopped threads")
-
-	def _recv_loop(self) -> None:
-		"""Background loop: receive audio/telemetry from Arduino."""
-		buffer = b""
-		while self.running:
-			try:
-				if self.serial_controller.ser and self.serial_controller.ser.in_waiting > 0:
-					chunk = self.serial_controller.ser.read(self.serial_controller.ser.in_waiting)
-					buffer += chunk
-
-					# Parse complete messages ending with \n
-					while b"\n" in buffer:
-						msg_bytes, buffer = buffer.split(b"\n", 1)
-						try:
-							msg = msg_bytes.decode("utf-8").strip()
-							if msg:
-								self.recv_queue.put(msg)
-						except UnicodeDecodeError as e:
-							print(f"[AudioHandler] Decode error: {e}")
-				time.sleep(0.001)
-			except Exception as e:
-				print(f"[AudioHandler] Receive loop error: {e}")
-				time.sleep(0.1)
-
-	def _send_loop(self) -> None:
-		"""Background loop: send queued audio/commands to Arduino."""
-		while self.running:
-			try:
-				msg = self.send_queue.get(timeout=0.1)
-				if self.serial_controller.ser and self.serial_controller.connected:
-					self.serial_controller.ser.write((msg + "\n").encode("utf-8"))
-			except queue.Empty:
-				pass
-			except Exception as e:
-				print(f"[AudioHandler] Send loop error: {e}")
-				time.sleep(0.1)
-
-	def queue_audio_to_send(self, audio_type: str, data: str) -> None:
-		"""Queue audio command to send to Arduino.
-		
-		Args:
-		    audio_type: Command type (e.g. "PLAY" for playback, "REC" for recording start)
-		    data: Payload (e.g. hex-encoded audio samples or command flags)
-		"""
-		msg = f"{audio_type},{data}"
-		self.send_queue.put(msg)
-
-	def get_received_message(self, block: bool = False, timeout: Optional[float] = None) -> Optional[str]:
-		"""Retrieve next received audio/telemetry message from Arduino.
-		
-		Returns:
-		    String message (e.g. "AUDIO,<samples>") or None if queue empty/timeout.
-		"""
-		try:
-			return self.recv_queue.get(block=block, timeout=timeout)
-		except queue.Empty:
-			return None
-
-	def queue_size(self) -> int:
-		"""Return number of pending received messages."""
-		return self.recv_queue.qsize()
+    def send_position_vector(self, x_error: float, y_error: float, confidence: float) -> bool:
+        if not self.connected or not self.ser:
+            return False
+        try:
+            msg = f"POS,{x_error:.4f},{y_error:.4f},{confidence:.2f}\n"
+            self.ser.write(msg.encode("utf-8"))
+            print(f"[SerialController] tx {msg.strip()}")
+            return True
+        except Exception as exc:
+            print(f"[SerialController] Error sending position vector: {exc}")
+            self.connected = False
+            return False
 
 
 def list_linux_video_indices(max_cameras: int) -> List[int]:
-	"""Return numeric indices from /dev/video* when available."""
-	indices: List[int] = []
-	for path in Path("/dev").glob("video*"):
-		match = re.fullmatch(r"video(\d+)", path.name)
-		if match:
-			indices.append(int(match.group(1)))
-
-	indices = sorted(set(indices))
-	return [idx for idx in indices if idx < max_cameras]
+    indices: List[int] = []
+    for path in Path("/dev").glob("video*"):
+        match = re.fullmatch(r"video(\d+)", path.name)
+        if match:
+            indices.append(int(match.group(1)))
+    indices = sorted(set(indices))
+    return [idx for idx in indices if idx < max_cameras]
 
 
 def discover_cameras(max_cameras: int = 10) -> List[CameraInfo]:
-	"""Probe camera indices and return working webcams."""
-	cameras: List[CameraInfo] = []
+    cameras: List[CameraInfo] = []
+    candidate_indices = list_linux_video_indices(max_cameras) if os.name == "posix" else []
+    if not candidate_indices:
+        candidate_indices = list(range(max_cameras))
 
-	if os.name == "posix":
-		candidate_indices = list_linux_video_indices(max_cameras=max_cameras)
-		if not candidate_indices:
-			candidate_indices = list(range(max_cameras))
-	else:
-		candidate_indices = list(range(max_cameras))
-
-	for idx in candidate_indices:
-		# CAP_V4L2 avoids some backend auto-probing noise on Linux.
-		if os.name == "posix":
-			cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-		else:
-			cap = cv2.VideoCapture(idx)
-		if not cap.isOpened():
-			cap.release()
-			continue
-
-		ok, frame = cap.read()
-		if ok and frame is not None:
-			h, w = frame.shape[:2]
-			cameras.append(CameraInfo(index=idx, width=w, height=h))
-		cap.release()
-	return cameras
+    for idx in candidate_indices:
+        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2) if os.name == "posix" else cv2.VideoCapture(idx)
+        if not cap.isOpened():
+            cap.release()
+            continue
+        ok, frame = cap.read()
+        if ok and frame is not None:
+            h, w = frame.shape[:2]
+            cameras.append(CameraInfo(index=idx, width=w, height=h))
+        cap.release()
+    return cameras
 
 
 def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]:
-	"""Open a native OS dialog and let user select a camera, features, and connection settings."""
-	try:
-		import tkinter as tk
-		from tkinter import messagebox
-	except Exception:
-		print("Tkinter not available. Falling back to terminal selection.")
-		for i, cam in enumerate(cameras, start=1):
-			print(f"[{i}] Camera {cam.index} ({cam.width}x{cam.height})")
-		choice = input("Select camera number (empty to cancel): ").strip()
-		if not choice:
-			return None
-		if not choice.isdigit():
-			return None
-		idx = int(choice) - 1
-		if 0 <= idx < len(cameras):
-			selected_resolution = RESOLUTION_PRESETS[1][1]
-			print("Resolution options:")
-			for i, (label, _) in enumerate(RESOLUTION_PRESETS, start=1):
-				print(f"[{i}] {label}")
-			resolution_choice = input("Select resolution number (empty for 1280x720): ").strip()
-			if resolution_choice.isdigit() and 1 <= int(resolution_choice) <= len(RESOLUTION_PRESETS):
-				selected_resolution = RESOLUTION_PRESETS[int(resolution_choice) - 1][1]
-			distance_choice = input("Use full-range face detection? [y/N]: ").strip().lower()
-			model_selection = 1 if distance_choice in ("y", "yes", "1", "full") else 0
-			return CameraSelection(
-				camera=cameras[idx],
-				resolution=selected_resolution,
-				model_selection=model_selection,
-			)
-		return None
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+    except Exception:
+        print("Tkinter not available. Falling back to terminal selection.")
+        for i, cam in enumerate(cameras, start=1):
+            print(f"[{i}] Camera {cam.index} ({cam.width}x{cam.height})")
+        choice = input("Select camera number (empty to cancel): ").strip()
+        if not choice.isdigit():
+            return None
+        idx = int(choice) - 1
+        if not (0 <= idx < len(cameras)):
+            return None
 
-	selected_index = {"value": None}
-	selected_resolution = {"value": RESOLUTION_PRESETS[1][1]}
-	model_state = {"value": 0}
-	selected_serial_port = {"value": None}
-	enable_servo_state = {"value": False}
-	enable_audio_state = {"value": False}
+        print("Resolution options:")
+        for i, (label, _) in enumerate(RESOLUTION_PRESETS, start=1):
+            print(f"[{i}] {label}")
+        resolution_choice = input("Select resolution number (empty for 1280x720): ").strip()
+        resolution = RESOLUTION_PRESETS[1][1]
+        if resolution_choice.isdigit() and 1 <= int(resolution_choice) <= len(RESOLUTION_PRESETS):
+            resolution = RESOLUTION_PRESETS[int(resolution_choice) - 1][1]
 
-	# Detect available serial ports
-	available_ports = detect_serial_ports()
-	port_labels = ["None (Tracking only)"] + [get_serial_port_label(p) for p in available_ports]
-	port_values = [None] + available_ports
+        distance_choice = input("Use full-range face detection? [y/N]: ").strip().lower()
+        model_selection = 1 if distance_choice in {"y", "yes", "1", "full"} else 0
+        print("Serial ports detected:")
+        for i, port in enumerate(detect_serial_ports(), start=1):
+            print(f"  [{i}] {port}")
+        serial_port = input("Serial port for Arduino (empty for none, or type a tty path): ").strip() or None
+        baud_text = input("Serial baudrate [115200]: ").strip()
+        baudrate = int(baud_text) if baud_text.isdigit() else 115200
+        return CameraSelection(cameras[idx], resolution, model_selection, serial_port, baudrate)
 
-	root = tk.Tk()
-	root.title("Select Webcam and Features")
-	root.resizable(False, False)
-	root.geometry("680x650")
+    selected_index = {"value": None}
+    selected_resolution = {"value": RESOLUTION_PRESETS[1][1]}
+    selected_model = {"value": 0}
+    selected_port = {"value": None}
+    selected_baudrate = {"value": 115200}
 
-	frame = tk.Frame(root, padx=12, pady=12)
-	frame.pack(fill="both", expand=True)
+    ports = detect_serial_ports()
+    port_labels = ["None (tracking only)"] + [get_serial_port_label(p) for p in ports]
+    port_values = [None] + ports
 
-	title_label = tk.Label(
-		frame,
-		text="Face Tracking Setup",
-		font=("DejaVu Sans", 11, "bold"),
-	)
-	title_label.pack(anchor="w")
+    root = tk.Tk()
+    root.title("Select Webcam and Serial Settings")
+    root.resizable(False, False)
+    root.geometry("560x560")
 
-	subtitle_label = tk.Label(
-		frame,
-		text="Configure camera, resolution, and optional features.",
-		font=("DejaVu Sans", 9),
-	)
-	subtitle_label.pack(anchor="w", pady=(4, 8))
+    frame = tk.Frame(root, padx=12, pady=12)
+    frame.pack(fill="both", expand=True)
 
-	# Camera settings section
-	camera_frame = tk.LabelFrame(frame, text="Camera Settings", padx=10, pady=10)
-	camera_frame.pack(fill="x", pady=(0, 10))
+    tk.Label(frame, text="Face Tracking Setup", font=("DejaVu Sans", 11, "bold")).pack(anchor="w")
+    tk.Label(frame, text="Configure camera, resolution, and serial output.").pack(anchor="w", pady=(4, 8))
 
-	resolution_row = tk.Frame(camera_frame)
-	resolution_row.pack(fill="x")
-	ttk = None
-	try:
-		from tkinter import ttk
-	except Exception:
-		pass
+    camera_frame = tk.LabelFrame(frame, text="Camera", padx=10, pady=10)
+    camera_frame.pack(fill="x", pady=(0, 10))
 
-	resolution_label = tk.Label(resolution_row, text="Resolution:")
-	resolution_label.pack(side="left")
+    resolution_names = [label for label, _ in RESOLUTION_PRESETS]
+    resolution_var = tk.StringVar(value=resolution_names[1])
+    model_var = tk.StringVar(value="Short-range")
+    serial_var = tk.StringVar(value=port_labels[0])
+    baudrate_var = tk.StringVar(value="115200")
 
-	resolution_names = [label for label, _size in RESOLUTION_PRESETS]
-	resolution_var = tk.StringVar(value=resolution_names[1])
-	resolution_menu = tk.OptionMenu(resolution_row, resolution_var, *resolution_names)
-	resolution_menu.pack(side="left", padx=(8, 0))
+    tk.Label(camera_frame, text="Resolution:").grid(row=0, column=0, sticky="w")
+    tk.OptionMenu(camera_frame, resolution_var, *resolution_names).grid(row=0, column=1, sticky="w", padx=8)
 
-	model_row = tk.Frame(camera_frame)
-	model_row.pack(fill="x", pady=(10, 0))
+    tk.Label(camera_frame, text="Distance mode:").grid(row=1, column=0, sticky="w", pady=(8, 0))
 
-	model_label = tk.Label(model_row, text="Distance mode:")
-	model_label.pack(side="left")
+    def toggle_model() -> None:
+        selected_model["value"] = 1 - selected_model["value"]
+        model_var.set("Full-range" if selected_model["value"] else "Short-range")
 
-	model_button_text = tk.StringVar(value="Short-range")
-	model_button = tk.Button(model_row, textvariable=model_button_text, width=16)
-	model_button.pack(side="left", padx=(8, 0))
+    tk.Button(camera_frame, textvariable=model_var, width=16, command=toggle_model).grid(row=1, column=1, sticky="w", padx=8, pady=(8, 0))
 
-	def sync_resolution() -> None:
-		choice = resolution_var.get()
-		for label, size in RESOLUTION_PRESETS:
-			if label == choice:
-				selected_resolution["value"] = size
-				return
+    serial_frame = tk.LabelFrame(frame, text="Serial", padx=10, pady=10)
+    serial_frame.pack(fill="x", pady=(0, 10))
 
-	def toggle_distance_mode() -> None:
-		model_state["value"] = 1 - model_state["value"]
-		model_button_text.set("Full-range" if model_state["value"] else "Short-range")
+    tk.Label(serial_frame, text="Port:").grid(row=0, column=0, sticky="w")
+    tk.OptionMenu(serial_frame, serial_var, *port_labels).grid(row=0, column=1, sticky="w", padx=8)
 
-	model_button.configure(command=toggle_distance_mode)
-	resolution_var.trace_add("write", lambda *_args: sync_resolution())
-	sync_resolution()
+    tk.Label(serial_frame, text="Or manual tty:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+    manual_port_var = tk.StringVar(value="")
+    tk.Entry(serial_frame, textvariable=manual_port_var, width=24).grid(row=1, column=1, sticky="w", padx=8, pady=(8, 0))
 
-	# Arduino / Serial settings section
-	features_frame = tk.LabelFrame(frame, text="Optional Features", padx=10, pady=10)
-	features_frame.pack(fill="x", pady=(0, 10))
+    tk.Label(serial_frame, text="Baudrate:").grid(row=2, column=0, sticky="w", pady=(8, 0))
+    tk.Entry(serial_frame, textvariable=baudrate_var, width=10).grid(row=2, column=1, sticky="w", padx=8, pady=(8, 0))
 
-	# Serial port selector
-	serial_row = tk.Frame(features_frame)
-	serial_row.pack(fill="x")
+    list_label = tk.Label(frame, text="Available Cameras:", font=("DejaVu Sans", 9, "bold"))
+    list_label.pack(anchor="w", pady=(8, 4))
+    list_frame = tk.Frame(frame)
+    list_frame.pack(fill="both", expand=True)
 
-	serial_label = tk.Label(serial_row, text="Serial Port:")
-	serial_label.pack(side="left")
+    scrollbar = tk.Scrollbar(list_frame, orient="vertical")
+    listbox = tk.Listbox(list_frame, height=8, exportselection=False, yscrollcommand=scrollbar.set)
+    scrollbar.config(command=listbox.yview)
+    scrollbar.pack(side="right", fill="y")
+    listbox.pack(side="left", fill="both", expand=True)
+    for cam in cameras:
+        listbox.insert("end", f"Camera {cam.index} ({cam.width}x{cam.height})")
+    if cameras:
+        listbox.selection_set(0)
 
-	serial_var = tk.StringVar(value=port_labels[0])
-	serial_menu = tk.OptionMenu(serial_row, serial_var, *port_labels)
-	serial_menu.pack(side="left", padx=(8, 0))
+    def sync_resolution() -> None:
+        for label, size in RESOLUTION_PRESETS:
+            if label == resolution_var.get():
+                selected_resolution["value"] = size
+                break
 
-	def sync_serial_port() -> None:
-		choice = serial_var.get()
-		for i, label in enumerate(port_labels):
-			if label == choice:
-				selected_serial_port["value"] = port_values[i]
-				return
+    def sync_serial() -> None:
+        manual = manual_port_var.get().strip()
+        if manual:
+            selected_port["value"] = manual
+            return
+        choice = serial_var.get()
+        for i, label in enumerate(port_labels):
+            if label == choice:
+                selected_port["value"] = port_values[i]
+                break
 
-	serial_var.trace_add("write", lambda *_args: sync_serial_port())
-	sync_serial_port()
+    def sync_baudrate() -> None:
+        try:
+            selected_baudrate["value"] = int(baudrate_var.get().strip())
+        except ValueError:
+            selected_baudrate["value"] = 115200
 
-	# Feature toggles
-	servo_row = tk.Frame(features_frame)
-	servo_row.pack(fill="x", pady=(10, 0))
+    resolution_var.trace_add("write", lambda *_: sync_resolution())
+    serial_var.trace_add("write", lambda *_: sync_serial())
+    manual_port_var.trace_add("write", lambda *_: sync_serial())
+    baudrate_var.trace_add("write", lambda *_: sync_baudrate())
+    sync_resolution()
+    sync_serial()
+    sync_baudrate()
 
-	servo_button_text = tk.StringVar(value="Servo Control: OFF")
-	servo_button = tk.Button(servo_row, textvariable=servo_button_text, width=20, bg="#ffcccc")
-	servo_button.pack(side="left")
+    def open_selected() -> None:
+        selection = listbox.curselection()
+        if not selection:
+            messagebox.showinfo("No selection", "Please select a camera first.")
+            return
+        selected_index["value"] = selection[0]
+        root.destroy()
 
-	def toggle_servo() -> None:
-		enable_servo_state["value"] = not enable_servo_state["value"]
-		servo_button_text.set("Servo Control: ON" if enable_servo_state["value"] else "Servo Control: OFF")
-		servo_button.config(bg="#ccffcc" if enable_servo_state["value"] else "#ffcccc")
+    def cancel() -> None:
+        selected_index["value"] = None
+        root.destroy()
 
-	servo_button.configure(command=toggle_servo)
+    button_frame = tk.Frame(frame)
+    button_frame.pack(fill="x", pady=(10, 0))
+    tk.Button(button_frame, text="Open", width=12, command=open_selected).pack(side="right", padx=(8, 0))
+    tk.Button(button_frame, text="Cancel", width=12, command=cancel).pack(side="right")
+    root.protocol("WM_DELETE_WINDOW", cancel)
+    root.mainloop()
 
-	audio_row = tk.Frame(features_frame)
-	audio_row.pack(fill="x", pady=(5, 0))
-
-	audio_button_text = tk.StringVar(value="Audio Recognition: OFF")
-	audio_button = tk.Button(audio_row, textvariable=audio_button_text, width=20, bg="#ffcccc")
-	audio_button.pack(side="left")
-
-	def toggle_audio() -> None:
-		enable_audio_state["value"] = not enable_audio_state["value"]
-		audio_button_text.set("Audio Recognition: ON" if enable_audio_state["value"] else "Audio Recognition: OFF")
-		audio_button.config(bg="#ccffcc" if enable_audio_state["value"] else "#ffcccc")
-
-	audio_button.configure(command=toggle_audio)
-
-	# Camera list
-	list_label = tk.Label(frame, text="Available Cameras:", font=("DejaVu Sans", 9, "bold"))
-	list_label.pack(anchor="w", pady=(8, 4))
-
-	list_frame = tk.Frame(frame)
-	list_frame.pack(fill="both", expand=True)
-
-	scrollbar = tk.Scrollbar(list_frame, orient="vertical")
-	listbox = tk.Listbox(
-		list_frame,
-		height=8,
-		exportselection=False,
-		yscrollcommand=scrollbar.set,
-		font=("DejaVu Sans", 10),
-	)
-	scrollbar.config(command=listbox.yview)
-	scrollbar.pack(side="right", fill="y")
-	listbox.pack(side="left", fill="both", expand=True)
-
-	for cam in cameras:
-		listbox.insert("end", f"Camera {cam.index} ({cam.width}x{cam.height})")
-
-	if cameras:
-		listbox.selection_set(0)
-
-	def select_and_close() -> None:
-		selection = listbox.curselection()
-		if not selection:
-			messagebox.showinfo("No selection", "Please select a camera first.")
-			return
-		selected_index["value"] = selection[0]
-		root.destroy()
-
-	def cancel_and_close() -> None:
-		selected_index["value"] = None
-		root.destroy()
-
-	button_frame = tk.Frame(frame)
-	button_frame.pack(fill="x", pady=(10, 0))
-
-	open_button = tk.Button(button_frame, text="Open", width=12, command=select_and_close)
-	open_button.pack(side="right", padx=(8, 0))
-
-	cancel_button = tk.Button(button_frame, text="Cancel", width=12, command=cancel_and_close)
-	cancel_button.pack(side="right")
-
-	listbox.bind("<Double-1>", lambda _event: select_and_close())
-	root.protocol("WM_DELETE_WINDOW", cancel_and_close)
-	root.mainloop()
-
-	idx = selected_index["value"]
-	if idx is None:
-		return None
-	if 0 <= idx < len(cameras):
-		return CameraSelection(
-			camera=cameras[idx],
-			resolution=selected_resolution["value"],
-			model_selection=model_state["value"],
-			serial_port=selected_serial_port["value"],
-			enable_servo=enable_servo_state["value"],
-			enable_audio=enable_audio_state["value"],
-		)
-	return None
+    idx = selected_index["value"]
+    if idx is None or not (0 <= idx < len(cameras)):
+        return None
+    return CameraSelection(
+        camera=cameras[idx],
+        resolution=selected_resolution["value"],
+        model_selection=selected_model["value"],
+        serial_port=selected_port["value"],
+        serial_baudrate=selected_baudrate["value"],
+    )
 
 
 def open_camera(camera_index: int) -> cv2.VideoCapture:
-	"""Open a webcam with a Linux-friendly backend when possible."""
-	if os.name == "posix":
-		return cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
-	return cv2.VideoCapture(camera_index)
+    return cv2.VideoCapture(camera_index, cv2.CAP_V4L2) if os.name == "posix" else cv2.VideoCapture(camera_index)
 
 
-def build_face_detector(
-	model_selection: int,
-	min_detection_confidence: float,
-) -> Any:
-	"""Create the MediaPipe face detector used by the tracking loop."""
-	try:
-		import mediapipe as mp
-	except ImportError as exc:
-		raise RuntimeError(
-			"MediaPipe is not installed. Install opencv-contrib-python==4.10.0.84, mediapipe==0.10.14, and numpy==1.26.4 in your environment first."
-		) from exc
-
-	return mp.solutions.face_detection.FaceDetection(
-		model_selection=model_selection,
-		min_detection_confidence=min_detection_confidence,
-	)
+def build_face_detector(model_selection: int, min_detection_confidence: float) -> Any:
+    try:
+        import mediapipe as mp
+    except ImportError as exc:
+        raise RuntimeError(
+            "MediaPipe is not installed. Install opencv-contrib-python==4.10.0.84, mediapipe==0.10.14, and numpy==1.26.4 first."
+        ) from exc
+    return mp.solutions.face_detection.FaceDetection(
+        model_selection=model_selection,
+        min_detection_confidence=min_detection_confidence,
+    )
 
 
-def select_largest_detection(
-	detections: List[Any],
-	frame_width: int,
-	frame_height: int,
-) -> Optional[Tuple[int, int, int, int, float]]:
-	"""Return the largest face detection as a pixel-space bounding box."""
-	best: Optional[Tuple[int, int, int, int, float]] = None
-	best_area = -1
-
-	for detection in detections:
-		box = detection.location_data.relative_bounding_box
-		x1 = max(0, int(box.xmin * frame_width))
-		y1 = max(0, int(box.ymin * frame_height))
-		x2 = min(frame_width, int((box.xmin + box.width) * frame_width))
-		y2 = min(frame_height, int((box.ymin + box.height) * frame_height))
-		box_width = max(0, x2 - x1)
-		box_height = max(0, y2 - y1)
-		area = box_width * box_height
-		if area <= 0:
-			continue
-
-		score = float(detection.score[0]) if detection.score else 0.0
-		if area > best_area:
-			best_area = area
-			best = (x1, y1, box_width, box_height, score)
-
-	return best
+def select_largest_detection(detections: List[Any], frame_width: int, frame_height: int) -> Optional[Tuple[int, int, int, int, float]]:
+    best: Optional[Tuple[int, int, int, int, float]] = None
+    best_area = -1
+    for detection in detections:
+        box = detection.location_data.relative_bounding_box
+        x1 = max(0, int(box.xmin * frame_width))
+        y1 = max(0, int(box.ymin * frame_height))
+        x2 = min(frame_width, int((box.xmin + box.width) * frame_width))
+        y2 = min(frame_height, int((box.ymin + box.height) * frame_height))
+        box_width = max(0, x2 - x1)
+        box_height = max(0, y2 - y1)
+        area = box_width * box_height
+        if area <= 0:
+            continue
+        score = float(detection.score[0]) if detection.score else 0.0
+        if area > best_area:
+            best_area = area
+            best = (x1, y1, box_width, box_height, score)
+    return best
 
 
 def run_face_tracking(
-	camera_index: int,
-	model_selection: int,
-	min_detection_confidence: float,
-	target_resolution: Optional[Tuple[int, int]] = None,
-	serial_port: Optional[str] = None,
-	serial_baudrate: int = 115200,
-	enable_servo: bool = False,
-	enable_audio: bool = False,
+    camera_index: int,
+    model_selection: int,
+    min_detection_confidence: float,
+    target_resolution: Optional[Tuple[int, int]] = None,
+    serial_port: Optional[str] = None,
+    serial_baudrate: int = 115200,
 ) -> None:
-	"""Run the real-time face tracking loop.
-	
-	Args:
-	    camera_index: Camera device index to open.
-	    model_selection: MediaPipe model (0=short-range, 1=full-range).
-	    min_detection_confidence: Minimum confidence for face detection.
-	    target_resolution: Optional (width, height) to set on camera.
-	    serial_port: Optional serial port path (e.g. /dev/ttyUSB0).
-	    serial_baudrate: Serial baud rate (default 115200).
-	    enable_servo: If True, send servo commands to Arduino.
-	    enable_audio: If True, start background audio I/O handler.
-	"""
-	cap = open_camera(camera_index)
-	if not cap.isOpened():
-		raise RuntimeError(f"Could not open camera {camera_index}")
+    cap = open_camera(camera_index)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera {camera_index}")
 
-	if target_resolution is not None:
-		width, height = target_resolution
-		cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
-		cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
-		cap.set(cv2.CAP_PROP_FPS, 30.0)
+    if target_resolution is not None:
+        width, height = target_resolution
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
+        cap.set(cv2.CAP_PROP_FPS, 30.0)
 
-	# Initialize optional serial controller for servo commands
-	serial_ctrl: Optional[SerialController] = None
-	audio_handler: Optional[AudioHandler] = None
-	
-	if enable_servo or enable_audio:
-		if not serial_port:
-			print("[run_face_tracking] Warning: Features enabled but no serial port selected. Features disabled.")
-		else:
-			try:
-				serial_ctrl = SerialController(port=serial_port, baudrate=serial_baudrate)
-				if not serial_ctrl.connect():
-					print(f"[run_face_tracking] Warning: Could not connect to {serial_port}, features disabled.")
-					serial_ctrl = None
-				else:
-					if enable_audio:
-						audio_handler = AudioHandler(serial_ctrl)
-						audio_handler.start()
-						print("[run_face_tracking] Audio handler started")
-			except Exception as e:
-				print(f"[run_face_tracking] Warning: Serial init failed: {e}, features disabled.")
-				serial_ctrl = None
+    serial_ctrl: Optional[SerialController] = None
+    if serial_port:
+        serial_ctrl = SerialController(port=serial_port, baudrate=serial_baudrate)
+        if not serial_ctrl.connect():
+            serial_ctrl = None
 
-	window_name = f"Face Tracking - Camera {camera_index}"
-	window_open = False
-	detector = None
-	try:
-		detector = build_face_detector(
-			model_selection=model_selection,
-			min_detection_confidence=min_detection_confidence,
-		)
-		cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-		window_open = True
+    detector = None
+    window_name = f"Face Tracking - Camera {camera_index}"
+    try:
+        detector = build_face_detector(model_selection, min_detection_confidence)
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        prev = time.time()
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                print("Frame read failed, stopping.")
+                break
 
-		prev = time.time()
-		while True:
-			ok, frame = cap.read()
-			if not ok or frame is None:
-				print("Frame read failed, stopping.")
-				break
+            frame = cv2.flip(frame, 1)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = detector.process(rgb)
 
-			frame = cv2.flip(frame, 1)
-			rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-			results = detector.process(rgb)
+            h, w = frame.shape[:2]
+            cx, cy = w // 2, h // 2
+            cv2.drawMarker(frame, (cx, cy), (0, 180, 255), markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
 
-			h, w = frame.shape[:2]
-			cx, cy = w // 2, h // 2
-			cv2.drawMarker(
-				frame,
-				(cx, cy),
-				(0, 180, 255),
-				markerType=cv2.MARKER_CROSS,
-				markerSize=20,
-				thickness=2,
-			)
+            target = select_largest_detection(results.detections, w, h) if results.detections else None
+            if target is not None:
+                x, y, fw, fh, score = target
+                tx, ty = x + fw // 2, y + fh // 2
+                cv2.rectangle(frame, (x, y), (x + fw, y + fh), (70, 240, 90), 2)
+                cv2.circle(frame, (tx, ty), 4, (70, 240, 90), -1)
+                cv2.line(frame, (cx, cy), (tx, ty), (70, 240, 90), 2)
+                err_x = (tx - cx) / max(1, cx)
+                err_y = (ty - cy) / max(1, cy)
+                packet = f"POS,{err_x:+.4f},{err_y:+.4f},{score:.2f}"
+                cv2.putText(
+                    frame,
+                    packet,
+                    (16, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.60,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                if serial_ctrl:
+                    serial_ctrl.send_position_vector(err_x, err_y, score)
+            else:
+                cv2.putText(frame, "No face detected", (16, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (70, 120, 240), 2, cv2.LINE_AA)
+                if serial_ctrl:
+                    serial_ctrl.send_position_vector(0.0, 0.0, 0.0)
 
-			target = None
-			if results.detections:
-				target = select_largest_detection(results.detections, w, h)
+            now = time.time()
+            fps = 1.0 / max(1e-6, now - prev)
+            prev = now
+            cv2.putText(frame, f"FPS: {fps:.1f}", (16, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
-			if target is not None:
-				x, y, fw, fh, score = target
-				tx, ty = x + fw // 2, y + fh // 2
-				cv2.rectangle(frame, (x, y), (x + fw, y + fh), (70, 240, 90), 2)
-				cv2.circle(frame, (tx, ty), 4, (70, 240, 90), -1)
-				cv2.line(frame, (cx, cy), (tx, ty), (70, 240, 90), 2)
-
-				err_x = (tx - cx) / max(1, cx)
-				err_y = (ty - cy) / max(1, cy)
-				cv2.putText(
-					frame,
-					f"MediaPipe face score={score:.2f} | error x={err_x:+.2f}, y={err_y:+.2f}",
-					(16, 32),
-					cv2.FONT_HERSHEY_SIMPLEX,
-					0.65,
-					(255, 255, 255),
-					2,
-					cv2.LINE_AA,
-				)
-
-				# Send X error to Arduino for servo control (if enabled)
-				if enable_servo and serial_ctrl:
-					serial_ctrl.send_servo_command(err_x, confidence=score)
-			else:
-				cv2.putText(
-					frame,
-					"No face detected",
-					(16, 32),
-					cv2.FONT_HERSHEY_SIMPLEX,
-					0.7,
-					(70, 120, 240),
-					2,
-					cv2.LINE_AA,
-				)
-
-				# Send zero error when no face detected (if servo enabled)
-				if enable_servo and serial_ctrl:
-					serial_ctrl.send_servo_command(0.0, confidence=0.0)
-
-			now = time.time()
-			fps = 1.0 / max(1e-6, now - prev)
-			prev = now
-			cv2.putText(
-				frame,
-				f"FPS: {fps:.1f}",
-				(16, h - 16),
-				cv2.FONT_HERSHEY_SIMPLEX,
-				0.7,
-				(255, 255, 255),
-				2,
-				cv2.LINE_AA,
-			)
-
-			cv2.imshow(window_name, frame)
-			key = cv2.waitKey(1) & 0xFF
-			if key in (27, ord("q")):
-				break
-	finally:
-		cap.release()
-		if detector is not None:
-			detector.close()
-		if window_open:
-			cv2.destroyWindow(window_name)
-		if audio_handler:
-			audio_handler.stop()
-		if serial_ctrl:
-			serial_ctrl.disconnect()
+            cv2.imshow(window_name, frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord("q")):
+                break
+    finally:
+        cap.release()
+        if detector is not None:
+            detector.close()
+        cv2.destroyAllWindows()
+        if serial_ctrl:
+            serial_ctrl.disconnect()
 
 
 def parse_args() -> argparse.Namespace:
-	parser = argparse.ArgumentParser(description="Real-time OpenCV + MediaPipe face tracking")
-	parser.add_argument(
-		"--max-cameras",
-		type=int,
-		default=10,
-		help="How many camera indices to probe.",
-	)
-	parser.add_argument(
-		"--camera-index",
-		type=int,
-		default=None,
-		help="Skip selection and open this camera index directly.",
-	)
-	parser.add_argument(
-		"--model-selection",
-		type=int,
-		choices=[0, 1],
-		default=0,
-		help="MediaPipe face detector model: 0 for short-range, 1 for full-range.",
-	)
-	parser.add_argument(
-		"--min-detection-confidence",
-		type=float,
-		default=0.5,
-		help="Minimum confidence required for a face detection.",
-	)
-	parser.add_argument(
-		"--serial-port",
-		type=str,
-		default=None,
-		help="Serial port path for Arduino communication (e.g. /dev/ttyUSB0). If not set, servo control is disabled.",
-	)
-	parser.add_argument(
-		"--serial-baudrate",
-		type=int,
-		default=115200,
-		help="Baud rate for serial communication (default 115200).",
-	)
-	return parser.parse_args()
+    parser = argparse.ArgumentParser(description="Real-time OpenCV + MediaPipe face tracking")
+    parser.add_argument("--max-cameras", type=int, default=10, help="How many camera indices to probe.")
+    parser.add_argument("--camera-index", type=int, default=None, help="Skip selection and open this camera index directly.")
+    parser.add_argument("--model-selection", type=int, choices=[0, 1], default=0, help="MediaPipe face detector model.")
+    parser.add_argument("--min-detection-confidence", type=float, default=0.5, help="Minimum confidence required for a face detection.")
+    parser.add_argument("--serial-port", type=str, default=None, help="Serial port path for Arduino communication.")
+    parser.add_argument("--serial-baudrate", type=int, default=115200, help="Baud rate for serial communication.")
+    return parser.parse_args()
 
 
 def main() -> None:
-	args = parse_args()
+    args = parse_args()
 
-	if args.camera_index is None:
-		cameras = discover_cameras(max_cameras=args.max_cameras)
-		if not cameras:
-			print("No webcams detected. Connect a camera and retry.")
-			return
+    if args.camera_index is None:
+        cameras = discover_cameras(max_cameras=args.max_cameras)
+        if not cameras:
+            print("No webcams detected. Connect a camera and retry.")
+            return
+        selected = select_camera_window(cameras)
+        if selected is None:
+            print("No camera selected. Exiting.")
+            return
+        cam_index = selected.camera.index
+        model_selection = selected.model_selection
+        target_resolution = selected.resolution
+        serial_port = selected.serial_port
+        serial_baudrate = selected.serial_baudrate
+    else:
+        cam_index = args.camera_index
+        model_selection = args.model_selection
+        target_resolution = None
+        serial_port = args.serial_port
+        serial_baudrate = args.serial_baudrate
 
-		selected = select_camera_window(cameras)
-		if selected is None:
-			print("No camera selected. Exiting.")
-			return
-		cam_index = selected.camera.index
-		model_selection = selected.model_selection
-		target_resolution = selected.resolution
-		serial_port = selected.serial_port
-		enable_servo = selected.enable_servo
-		enable_audio = selected.enable_audio
-	else:
-		cam_index = args.camera_index
-		model_selection = args.model_selection
-		target_resolution = None
-		serial_port = args.serial_port
-		enable_servo = args.serial_port is not None  # Enable servo if serial port specified via CLI
-		enable_audio = False  # Audio must be explicitly enabled via GUI for now
-
-	run_face_tracking(
-		camera_index=cam_index,
-		model_selection=model_selection,
-		min_detection_confidence=args.min_detection_confidence,
-		target_resolution=target_resolution,
-		serial_port=serial_port,
-		serial_baudrate=args.serial_baudrate,
-		enable_servo=enable_servo,
-		enable_audio=enable_audio,
-	)
-	cv2.destroyAllWindows()
+    run_face_tracking(
+        camera_index=cam_index,
+        model_selection=model_selection,
+        min_detection_confidence=args.min_detection_confidence,
+        target_resolution=target_resolution,
+        serial_port=serial_port,
+        serial_baudrate=serial_baudrate,
+    )
 
 
 if __name__ == "__main__":
-	main()
+    main()

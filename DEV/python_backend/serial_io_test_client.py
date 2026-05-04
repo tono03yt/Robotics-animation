@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
-"""Interactive serial protocol test client for the face-tracking / Arduino link.
+"""Serial packet monitor for the face-tracking backend.
 
-This tool is meant to test the same newline-delimited protocol used by
-face_tracking_test.py without starting the full vision pipeline.
-
-Typical use:
-- connect to Arduino Nano over USB serial
-- send SERVO commands manually
-- send PLAY / REC commands for audio protocol testing
-- print any incoming AUDIO / STAT / debug messages from Arduino
+Modes:
+- real serial port: attach to Arduino or a backend connected to a tty
+- bridge mode: create an empty pseudo-TTY for the backend to connect to,
+  while this script snoops the master side and prints packets
 """
 
 from __future__ import annotations
 
 import argparse
-import os
-import queue
-import re
 import sys
-import threading
+import os
+import pty
+import re
+import errno
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 try:
     import serial
@@ -31,167 +28,284 @@ except ImportError:
     list_ports = None
 
 
+POS_RE = re.compile(r"^POS,(-?[\d.]+),(-?[\d.]+),([\d.]+)$")
+STAT_RE = re.compile(r"^STAT,(\d+),(\d+)$")
+DEBUG_RE = re.compile(r"^\[")
+
+
+@dataclass
+class Packet:
+    valid: bool
+    kind: str
+    fields: Dict[str, object]
+    raw: str
+
+
 def detect_serial_ports() -> List[str]:
-    """Return a list of serial port device paths available on this machine."""
     ports: List[str] = []
-
     if list_ports is not None:
-        for port in list_ports.comports():
-            ports.append(port.device)
-
+        ports.extend(port.device for port in list_ports.comports())
     if ports:
         return sorted(set(ports))
-
-    # Fallback scan for Linux/macOS-style tty devices when pyserial tools are unavailable.
-    for pattern in ("ttyUSB*", "ttyACM*", "ttyS*", "cu.*"):
-        for path in Path("/dev").glob(pattern):
-            ports.append(str(path))
-
+    for pattern in ("ttyUSB*", "ttyACM*", "ttyS*"):
+        ports.extend(str(path) for path in Path("/dev").glob(pattern))
     return sorted(set(ports))
 
 
-class SerialProtocolClient:
-    """Interactive helper for sending and receiving serial protocol messages."""
+def detect_virtual_ttys() -> List[str]:
+    ports: List[str] = []
+    for path in Path("/dev/pts").glob("*"):
+        if path.name.isdigit():
+            ports.append(str(path))
+    return sorted(set(ports))
 
-    def __init__(self, port: str, baudrate: int = 115200, timeout: float = 0.2) -> None:
-        if serial is None:
-            raise RuntimeError("pyserial is not installed. Install with: pip install pyserial")
 
+def parse_packet(line: str) -> Packet:
+    line = line.strip()
+    if not line:
+        return Packet(False, "EMPTY", {"error": "empty packet"}, line)
+    if DEBUG_RE.match(line):
+        return Packet(True, "DEBUG", {"text": line}, line)
+
+    match = POS_RE.match(line)
+    if match:
+        return Packet(
+            True,
+            "POS",
+            {"x_error": float(match.group(1)), "y_error": float(match.group(2)), "confidence": float(match.group(3))},
+            line,
+        )
+
+    match = STAT_RE.match(line)
+    if match:
+        return Packet(True, "STAT", {"servo_us": int(match.group(1)), "millis": int(match.group(2))}, line)
+
+    if "," in line:
+        prefix = line.split(",", 1)[0] or "UNKNOWN"
+        return Packet(False, prefix, {"error": "unrecognized packet"}, line)
+    return Packet(False, "MALFORMED", {"error": "malformed packet"}, line)
+
+
+class SerialMonitor:
+    def __init__(self, port: Optional[str], baudrate: int = 115200) -> None:
         self.port = port
         self.baudrate = baudrate
-        self.timeout = timeout
-        self.ser: Optional[object] = None
+        self.serial = None
+        self.master_fd: Optional[int] = None
+        self.bridge_slave_path: Optional[str] = None
         self.running = False
-        self.reader_thread: Optional[threading.Thread] = None
-        self.incoming: queue.Queue[str] = queue.Queue()
+        self.rx_total = 0
+        self.rx_valid = 0
+        self.rx_invalid = 0
+        self.by_kind: Dict[str, int] = {}
+
+    def create_bridge(self) -> str:
+        master_fd, slave_fd = pty.openpty()
+        self.master_fd = master_fd
+        self.bridge_slave_path = os.ttyname(slave_fd)
+        os.close(slave_fd)
+        os.set_blocking(master_fd, False)
+        return self.bridge_slave_path
 
     def connect(self) -> bool:
-        """Open the serial port."""
-        try:
-            self.ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
-            time.sleep(0.5)  # Give Arduino Nano time to reset
-            self.running = True
-            self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
-            self.reader_thread.start()
-            print(f"[connected] {self.port} @ {self.baudrate}")
-            return True
-        except Exception as exc:
-            print(f"[error] Could not open {self.port}: {exc}")
-            self.ser = None
-            self.running = False
-            return False
+        if self.port is None:
+            raise RuntimeError("No serial port specified")
+        if serial is None:
+            raise RuntimeError("pyserial is not installed. Install with: pip install pyserial")
+        self.serial = serial.Serial(self.port, self.baudrate, timeout=0.1)
+        return True
 
-    def disconnect(self) -> None:
-        """Close the serial port and stop background reader."""
-        self.running = False
-        if self.reader_thread is not None:
-            self.reader_thread.join(timeout=1.0)
-        if self.ser is not None:
-            try:
-                self.ser.close()
-            except Exception:
-                pass
-        self.ser = None
-        print("[disconnected]")
+    def start(self) -> None:
+        self.running = True
+        if self.master_fd is not None:
+            self._bridge_loop()
+        else:
+            self._serial_loop()
 
-    def _reader_loop(self) -> None:
-        """Print incoming lines from Arduino as they arrive."""
+    def _record(self, packet: Packet) -> None:
+        self.rx_total += 1
+        self.by_kind[packet.kind] = self.by_kind.get(packet.kind, 0) + 1
+        if packet.valid:
+            self.rx_valid += 1
+        else:
+            self.rx_invalid += 1
+
+    def _print_packet(self, packet: Packet) -> None:
+        status = "✓" if packet.valid else "✗"
+        if packet.kind == "POS":
+            print(
+                f"[rx {status}] POS     | x={packet.fields['x_error']:+.4f} "
+                f"y={packet.fields['y_error']:+.4f} conf={packet.fields['confidence']:.2f}"
+            )
+        elif packet.kind == "STAT":
+            print(f"[rx {status}] STAT    | servo_us={packet.fields['servo_us']} millis={packet.fields['millis']}")
+        elif packet.kind == "DEBUG":
+            print(f"[rx {status}] DEBUG   | {packet.fields['text']}")
+        else:
+            print(f"[rx {status}] {packet.kind:<7} | {packet.raw}")
+
+    def _bridge_loop(self) -> None:
+        assert self.master_fd is not None
         buffer = b""
-        while self.running and self.ser is not None:
-            try:
-                waiting = getattr(self.ser, "in_waiting", 0)
+        print(f"[bridge] backend should connect to: {self.bridge_slave_path}")
+        print("[bridge] monitoring master side; press Ctrl+C to stop")
+        try:
+            while self.running:
+                try:
+                    chunk = os.read(self.master_fd, 4096)
+                    if not chunk:
+                        time.sleep(0.02)
+                        continue
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        raw, buffer = buffer.split(b"\n", 1)
+                        line = raw.decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+                        packet = parse_packet(line)
+                        self._record(packet)
+                        self._print_packet(packet)
+                except BlockingIOError:
+                    time.sleep(0.02)
+                except OSError as exc:
+                    if exc.errno in {errno.EIO, errno.ENXIO}:
+                        # The slave side is not yet opened by the backend.
+                        time.sleep(0.05)
+                        continue
+                    raise
+        finally:
+            self.print_summary()
+
+    def _serial_loop(self) -> None:
+        assert self.serial is not None
+        buffer = b""
+        print(f"[connected] {self.port} @ {self.baudrate}")
+        try:
+            while self.running:
+                waiting = getattr(self.serial, "in_waiting", 0)
                 if waiting:
-                    chunk = self.ser.read(waiting)
+                    chunk = self.serial.read(waiting)
                     if chunk:
                         buffer += chunk
                         while b"\n" in buffer:
                             raw, buffer = buffer.split(b"\n", 1)
                             line = raw.decode("utf-8", errors="replace").strip()
-                            if line:
-                                self.incoming.put(line)
-                                print(f"[rx] {line}")
+                            if not line:
+                                continue
+                            packet = parse_packet(line)
+                            self._record(packet)
+                            self._print_packet(packet)
                 else:
                     time.sleep(0.02)
-            except Exception as exc:
-                print(f"[reader-error] {exc}")
-                time.sleep(0.1)
+        finally:
+            self.print_summary()
 
-    def send_line(self, line: str) -> bool:
-        """Send one newline-terminated message."""
-        if self.ser is None:
-            return False
-        try:
-            payload = (line.rstrip("\r\n") + "\n").encode("utf-8")
-            self.ser.write(payload)
-            print(f"[tx] {line.rstrip()}")
-            return True
-        except Exception as exc:
-            print(f"[error] Send failed: {exc}")
-            return False
-
-    def send_servo(self, x_error: float, confidence: float = 1.0) -> bool:
-        return self.send_line(f"SERVO,{x_error:.4f},{confidence:.2f}")
-
-    def send_play(self, duration_ms: int, sample_rate: int, hex_audio_data: str) -> bool:
-        return self.send_line(f"PLAY,{duration_ms},{sample_rate},{hex_audio_data}")
-
-    def send_rec(self, state: str) -> bool:
-        return self.send_line(f"REC,{state}")
-
-    def send_raw(self, line: str) -> bool:
-        return self.send_line(line)
-
-    def demo_sequence(self) -> None:
-        """Send a small set of protocol messages for quick testing."""
-        self.send_servo(0.0, 1.0)
-        time.sleep(0.2)
-        self.send_servo(-0.25, 0.92)
-        time.sleep(0.2)
-        self.send_servo(0.35, 0.88)
-        time.sleep(0.2)
-        self.send_rec("START")
-        time.sleep(0.2)
-        self.send_rec("STOP")
+    def print_summary(self) -> None:
+        print("\n--- monitor summary ---")
+        print(f"RX total: {self.rx_total}")
+        print(f"Valid:    {self.rx_valid}")
+        print(f"Invalid:  {self.rx_invalid}")
+        for kind, count in sorted(self.by_kind.items()):
+            print(f"  {kind}: {count}")
 
 
-def print_help() -> None:
-    print(
-        """
-Commands:
-  help
-      Show this help.
+@dataclass
+class StartupConfig:
+    mode: str  # "bridge" or "serial"
+    port: Optional[str]
+    baudrate: int
 
-  servo <x_error> [confidence]
-      Send a SERVO command, e.g.:
-      servo -0.15 0.93
 
-  play <duration_ms> <sample_rate> <hex_audio_data>
-      Send a PLAY command, e.g.:
-      play 500 16000 ffc0ffc0ffc0
+def _ask_choice(prompt: str, valid: set[str]) -> str:
+    while True:
+        value = input(prompt).strip().lower()
+        if value in valid:
+            return value
+        print(f"Invalid choice. Options: {', '.join(sorted(valid))}")
 
-  rec start|stop
-      Send REC,START or REC,STOP
 
-  raw <message>
-      Send any newline-delimited message as-is.
+def choose_startup_configuration() -> Optional[StartupConfig]:
+    print("\nSerial monitor startup")
+    print("======================")
+    print("1) Real serial device")
+    print("2) Internal bridge (no Arduino needed)")
+    print("3) List detected interfaces")
+    print("q) Quit")
 
-  demo
-      Send a short test sequence of SERVO/REC commands.
+    choice = _ask_choice("Select mode [1/2/3/q]: ", {"1", "2", "3", "q"})
+    if choice == "q":
+        return None
 
-  ports
-      List available serial ports.
+    if choice == "3":
+        real_ports = detect_serial_ports()
+        pts_ports = detect_virtual_ttys()
+        if real_ports:
+            print("Detected real serial ports:")
+            for port in real_ports:
+                print(f"  - {port}")
+        else:
+            print("No real serial ports detected.")
+        if pts_ports:
+            print("Detected virtual tty interfaces:")
+            for port in pts_ports:
+                print(f"  - {port}")
+        else:
+            print("No virtual tty interfaces detected yet.")
+        print()
+        return choose_startup_configuration()
 
-  quit / exit
-      Close the connection and exit.
-""".strip()
-    )
+    baud_text = input("Baudrate [115200]: ").strip()
+    baudrate = int(baud_text) if baud_text.isdigit() else 115200
+
+    if choice == "2":
+        return StartupConfig(mode="bridge", port=None, baudrate=baudrate)
+
+    print("Detected real serial ports:")
+    real_ports = detect_serial_ports()
+    if real_ports:
+        for i, port in enumerate(real_ports, start=1):
+            print(f"  [{i}] {port}")
+    else:
+        print("  (none detected)")
+
+    manual = input("Enter port path or leave empty to choose from list: ").strip()
+    if manual:
+        return StartupConfig(mode="serial", port=manual, baudrate=baudrate)
+
+    if not real_ports:
+        print("No ports found. You can try bridge mode instead.")
+        return None
+
+    idx_text = input("Select port number: ").strip()
+    if not idx_text.isdigit():
+        return None
+    idx = int(idx_text)
+    if not (1 <= idx <= len(real_ports)):
+        return None
+    return StartupConfig(mode="serial", port=real_ports[idx - 1], baudrate=baudrate)
+
+    def close(self) -> None:
+        self.running = False
+        if self.serial is not None:
+            try:
+                self.serial.close()
+            except Exception:
+                pass
+            self.serial = None
+        if self.master_fd is not None:
+            try:
+                os.close(self.master_fd)
+            except Exception:
+                pass
+            self.master_fd = None
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Interactive serial test client for face-tracking protocol")
-    parser.add_argument("--port", type=str, default=None, help="Serial port path (e.g. /dev/ttyUSB0)")
+    parser = argparse.ArgumentParser(description="Serial packet monitor for the face-tracking backend")
+    parser.add_argument("--port", type=str, default=None, help="Serial port path (real device or bridge slave)")
     parser.add_argument("--baudrate", type=int, default=115200, help="Serial baudrate")
-    parser.add_argument("--list-ports", action="store_true", help="List available serial ports and exit")
+    parser.add_argument("--list-ports", action="store_true", help="List detected serial ports and exit")
+    parser.add_argument("--bridge", action="store_true", help="Create an internal pseudo-TTY bridge for backend testing")
     args = parser.parse_args()
 
     if args.list_ports:
@@ -204,101 +318,39 @@ def main() -> None:
                 print(f"  - {port}")
         return
 
-    port = args.port
-    if port is None:
-        ports = detect_serial_ports()
-        if not ports:
-            print("No serial ports found. Use --port if you already know the device path.")
+    interactive = (
+        args.port is None
+        and not args.bridge
+        and sys.stdin.isatty()
+    )
+
+    if interactive:
+        config = choose_startup_configuration()
+        if config is None:
             return
+        if config.mode == "bridge":
+            args.bridge = True
+            args.baudrate = config.baudrate
+        else:
+            args.port = config.port
+            args.baudrate = config.baudrate
 
-        print("Available serial ports:")
-        for i, candidate in enumerate(ports, start=1):
-            print(f"  [{i}] {candidate}")
-
-        choice = input("Select port number (empty to cancel): ").strip()
-        if not choice:
-            return
-        if not choice.isdigit() or not (1 <= int(choice) <= len(ports)):
-            print("Invalid selection.")
-            return
-        port = ports[int(choice) - 1]
-
-    client = SerialProtocolClient(port=port, baudrate=args.baudrate)
-    if not client.connect():
-        return
-
-    print_help()
-
+    monitor = SerialMonitor(port=args.port, baudrate=args.baudrate)
     try:
-        while True:
-            try:
-                line = input("io-test> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                break
-
-            if not line:
-                continue
-
-            command, *rest = line.split(maxsplit=1)
-            command = command.lower()
-            payload = rest[0] if rest else ""
-
-            if command in {"quit", "exit", "q"}:
-                break
-            if command == "help":
-                print_help()
-                continue
-            if command == "ports":
-                ports = detect_serial_ports()
-                if not ports:
-                    print("No serial ports found.")
-                else:
-                    for candidate in ports:
-                        print(f"  - {candidate}")
-                continue
-            if command == "demo":
-                client.demo_sequence()
-                continue
-            if command == "servo":
-                parts = payload.split()
-                if not parts:
-                    print("Usage: servo <x_error> [confidence]")
-                    continue
-                x_error = float(parts[0])
-                confidence = float(parts[1]) if len(parts) > 1 else 1.0
-                client.send_servo(x_error, confidence)
-                continue
-            if command == "play":
-                parts = payload.split(maxsplit=2)
-                if len(parts) < 3:
-                    print("Usage: play <duration_ms> <sample_rate> <hex_audio_data>")
-                    continue
-                duration_ms = int(parts[0])
-                sample_rate = int(parts[1])
-                hex_audio_data = parts[2]
-                if not re.fullmatch(r"[0-9A-Fa-f]*", hex_audio_data):
-                    print("hex_audio_data must contain only hex characters")
-                    continue
-                client.send_play(duration_ms, sample_rate, hex_audio_data)
-                continue
-            if command == "rec":
-                state = payload.strip().upper()
-                if state not in {"START", "STOP"}:
-                    print("Usage: rec start|stop")
-                    continue
-                client.send_rec(state)
-                continue
-            if command == "raw":
-                if not payload:
-                    print("Usage: raw <message>")
-                    continue
-                client.send_raw(payload)
-                continue
-
-            print("Unknown command. Type 'help'.")
+        if args.bridge:
+            slave = monitor.create_bridge()
+            print(f"[bridge] connect backend to: {slave}")
+            monitor.start()
+        else:
+            if args.port is None:
+                print("No serial port specified. Re-run with no flags for interactive selection.")
+                return
+            monitor.connect()
+            monitor.start()
+    except KeyboardInterrupt:
+        print("\n[stopped]")
     finally:
-        client.disconnect()
+        monitor.close()
 
 
 if __name__ == "__main__":
