@@ -16,6 +16,7 @@ import pty
 import re
 import errno
 import time
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -30,7 +31,31 @@ except ImportError:
 
 POS_RE = re.compile(r"^POS,(-?[\d.]+),(-?[\d.]+),([\d.]+)$")
 STAT_RE = re.compile(r"^STAT,(\d+),(\d+)$")
+ANIM_RE = re.compile(r"^ANIM,(\w+),(.*)$")
+AUDIO_RE = re.compile(r"^AUDIO,(.+)$")
+TEXT_RE = re.compile(r"^TEXT,(.*)$")
 DEBUG_RE = re.compile(r"^\[")
+
+
+class Ansi:
+    RESET = "\033[0m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+
+
+def use_color() -> bool:
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def colorize(text: str, color: str) -> str:
+    if not use_color():
+        return text
+    return f"{color}{text}{Ansi.RESET}"
 
 
 @dataclass
@@ -80,6 +105,19 @@ def parse_packet(line: str) -> Packet:
     if match:
         return Packet(True, "STAT", {"servo_us": int(match.group(1)), "millis": int(match.group(2))}, line)
 
+    match = ANIM_RE.match(line)
+    if match:
+        return Packet(True, "ANIM", {"animation": match.group(1), "text": match.group(2)}, line)
+
+    match = AUDIO_RE.match(line)
+    if match:
+        b64 = match.group(1)
+        return Packet(True, "AUDIO", {"base64_len": len(b64)}, line)
+
+    match = TEXT_RE.match(line)
+    if match:
+        return Packet(True, "TEXT", {"text": match.group(1)}, line)
+
     if "," in line:
         prefix = line.split(",", 1)[0] or "UNKNOWN"
         return Packet(False, prefix, {"error": "unrecognized packet"}, line)
@@ -98,6 +136,10 @@ class SerialMonitor:
         self.rx_valid = 0
         self.rx_invalid = 0
         self.by_kind: Dict[str, int] = {}
+        # None = show all; otherwise a set of kinds to display (e.g. {"POS","STAT"})
+        self.display_kinds: Optional[set[str]] = None
+        self.input_queue: List[str] = []
+        self.input_lock = threading.Lock()
 
     def create_bridge(self) -> str:
         master_fd, slave_fd = pty.openpty()
@@ -131,29 +173,39 @@ class SerialMonitor:
             self.rx_invalid += 1
 
     def _print_packet(self, packet: Packet) -> None:
-        status = "✓" if packet.valid else "✗"
+        # filter by kind if requested
+        if self.display_kinds is not None and packet.kind not in self.display_kinds:
+            return
+        status = colorize("✓", Ansi.GREEN) if packet.valid else colorize("✗", Ansi.RED)
         if packet.kind == "POS":
             print(
-                f"[rx {status}] POS     | x={packet.fields['x_error']:+.4f} "
+                f"{colorize('[rx]', Ansi.CYAN)} {status} {colorize('POS', Ansi.BLUE):<14} | x={packet.fields['x_error']:+.4f} "
                 f"y={packet.fields['y_error']:+.4f} conf={packet.fields['confidence']:.2f}"
             )
         elif packet.kind == "STAT":
-            print(f"[rx {status}] STAT    | servo_us={packet.fields['servo_us']} millis={packet.fields['millis']}")
+            print(f"{colorize('[rx]', Ansi.CYAN)} {status} {colorize('STAT', Ansi.YELLOW):<14} | servo_us={packet.fields['servo_us']} millis={packet.fields['millis']}")
+        elif packet.kind == "ANIM":
+            print(f"{colorize('[rx]', Ansi.CYAN)} {status} {colorize('ANIM', Ansi.MAGENTA):<14} | animation={packet.fields['animation']} text={packet.fields['text']}")
+        elif packet.kind == "AUDIO":
+            print(f"{colorize('[rx]', Ansi.CYAN)} {status} {colorize('AUDIO', Ansi.GREEN):<14} | base64_len={packet.fields['base64_len']}")
+        elif packet.kind == "TEXT":
+            print(f"{colorize('[rx]', Ansi.CYAN)} {status} {colorize('TEXT', Ansi.BLUE):<14} | {packet.fields['text']}")
         elif packet.kind == "DEBUG":
-            print(f"[rx {status}] DEBUG   | {packet.fields['text']}")
+            print(f"{colorize('[rx]', Ansi.CYAN)} {status} {colorize('DEBUG', Ansi.DIM):<14} | {packet.fields['text']}")
         else:
-            print(f"[rx {status}] {packet.kind:<7} | {packet.raw}")
+            print(f"{colorize('[rx]', Ansi.CYAN)} {status} {colorize(packet.kind, Ansi.RED):<14} | {packet.raw}")
 
     def _bridge_loop(self) -> None:
         assert self.master_fd is not None
         buffer = b""
-        print(f"[bridge] backend should connect to: {self.bridge_slave_path}")
-        print("[bridge] monitoring master side; press Ctrl+C to stop")
+        print(colorize(f"[bridge] backend should connect to: {self.bridge_slave_path}", Ansi.YELLOW))
+        print(colorize("[bridge] monitoring master side; press Ctrl+C to stop", Ansi.DIM))
         try:
             while self.running:
                 try:
                     chunk = os.read(self.master_fd, 4096)
                     if not chunk:
+                        self._flush_input_queue()
                         time.sleep(0.02)
                         continue
                     buffer += chunk
@@ -166,6 +218,7 @@ class SerialMonitor:
                         self._record(packet)
                         self._print_packet(packet)
                 except BlockingIOError:
+                    self._flush_input_queue()
                     time.sleep(0.02)
                 except OSError as exc:
                     if exc.errno in {errno.EIO, errno.ENXIO}:
@@ -179,9 +232,10 @@ class SerialMonitor:
     def _serial_loop(self) -> None:
         assert self.serial is not None
         buffer = b""
-        print(f"[connected] {self.port} @ {self.baudrate}")
+        print(colorize(f"[connected] {self.port} @ {self.baudrate}", Ansi.GREEN))
         try:
             while self.running:
+                self._flush_input_queue()
                 waiting = getattr(self.serial, "in_waiting", 0)
                 if waiting:
                     chunk = self.serial.read(waiting)
@@ -208,81 +262,34 @@ class SerialMonitor:
         for kind, count in sorted(self.by_kind.items()):
             print(f"  {kind}: {count}")
 
+    def queue_text_input(self, text: str) -> None:
+        with self.input_lock:
+            self.input_queue.append(text)
 
-@dataclass
-class StartupConfig:
-    mode: str  # "bridge" or "serial"
-    port: Optional[str]
-    baudrate: int
+    def send_text_packet(self, text: str) -> bool:
+        payload = f"TEXT,{text}\n"
+        sent = False
+        if self.serial and self.serial.is_open:
+            self.serial.write(payload.encode("utf-8"))
+            sent = True
+        elif self.master_fd is not None:
+            os.write(self.master_fd, payload.encode("utf-8"))
+            sent = True
+        if not sent:
+            print(colorize(f"[tx] TEXT dropped (no active serial target): {text}", Ansi.RED))
+        return sent
 
+    def _flush_input_queue(self) -> None:
+        with self.input_lock:
+            for text in self.input_queue:
+                self.send_text_packet(text)
+            self.input_queue.clear()
 
-def _ask_choice(prompt: str, valid: set[str]) -> str:
-    while True:
-        value = input(prompt).strip().lower()
-        if value in valid:
-            return value
-        print(f"Invalid choice. Options: {', '.join(sorted(valid))}")
-
-
-def choose_startup_configuration() -> Optional[StartupConfig]:
-    print("\nSerial monitor startup")
-    print("======================")
-    print("1) Real serial device")
-    print("2) Internal bridge (no Arduino needed)")
-    print("3) List detected interfaces")
-    print("q) Quit")
-
-    choice = _ask_choice("Select mode [1/2/3/q]: ", {"1", "2", "3", "q"})
-    if choice == "q":
-        return None
-
-    if choice == "3":
-        real_ports = detect_serial_ports()
-        pts_ports = detect_virtual_ttys()
-        if real_ports:
-            print("Detected real serial ports:")
-            for port in real_ports:
-                print(f"  - {port}")
-        else:
-            print("No real serial ports detected.")
-        if pts_ports:
-            print("Detected virtual tty interfaces:")
-            for port in pts_ports:
-                print(f"  - {port}")
-        else:
-            print("No virtual tty interfaces detected yet.")
-        print()
-        return choose_startup_configuration()
-
-    baud_text = input("Baudrate [115200]: ").strip()
-    baudrate = int(baud_text) if baud_text.isdigit() else 115200
-
-    if choice == "2":
-        return StartupConfig(mode="bridge", port=None, baudrate=baudrate)
-
-    print("Detected real serial ports:")
-    real_ports = detect_serial_ports()
-    if real_ports:
-        for i, port in enumerate(real_ports, start=1):
-            print(f"  [{i}] {port}")
-    else:
-        print("  (none detected)")
-
-    manual = input("Enter port path or leave empty to choose from list: ").strip()
-    if manual:
-        return StartupConfig(mode="serial", port=manual, baudrate=baudrate)
-
-    if not real_ports:
-        print("No ports found. You can try bridge mode instead.")
-        return None
-
-    idx_text = input("Select port number: ").strip()
-    if not idx_text.isdigit():
-        return None
-    idx = int(idx_text)
-    if not (1 <= idx <= len(real_ports)):
-        return None
-    return StartupConfig(mode="serial", port=real_ports[idx - 1], baudrate=baudrate)
+    def set_display_kinds(self, kinds: Optional[List[str]]) -> None:
+        if kinds is None:
+            self.display_kinds = None
+            return
+        self.display_kinds = set(k.upper() for k in kinds)
 
     def close(self) -> None:
         self.running = False
@@ -300,13 +307,207 @@ def choose_startup_configuration() -> Optional[StartupConfig]:
             self.master_fd = None
 
 
+@dataclass
+class StartupConfig:
+    mode: str  # "bridge" or "serial"
+    port: Optional[str]
+    baudrate: int
+
+
+def _ask_choice(prompt: str, valid: set[str]) -> str:
+    while True:
+        value = input(prompt).strip().lower()
+        if value in valid:
+            return value
+        print(f"Invalid choice. Options: {', '.join(sorted(valid))}")
+
+
+def choose_startup_configuration() -> Optional[StartupConfig]:
+    print("\n" + "-" * 20)
+    print("Step 1: Select Mode")
+    print("-" * 20)
+    print("1) Real serial device  - Connect to a physical Arduino or USB-to-serial adapter.")
+    print("2) Internal bridge     - Create a virtual serial port for local testing (no hardware needed).")
+    print("3) List interfaces     - Show all detected real and virtual serial ports.")
+    print("q) Quit")
+
+    choice = _ask_choice("Select mode [1/2/3/q]: ", {"1", "2", "3", "q"})
+    if choice == "q":
+        return None
+
+    if choice == "3":
+        print("-" * 40)
+        real_ports = detect_serial_ports()
+        pts_ports = detect_virtual_ttys()
+        if real_ports:
+            print("Detected real serial ports (e.g., Arduino, USB adapters):")
+            for port in real_ports:
+                print(f"  - {port}")
+        else:
+            print("No real serial ports detected.")
+        if pts_ports:
+            print("\nDetected virtual tty interfaces (for local testing):")
+            for port in pts_ports:
+                print(f"  - {port}")
+        else:
+            print("\nNo virtual tty interfaces detected yet.")
+        print("-" * 40)
+        return choose_startup_configuration()
+
+    if choice == "1":
+        ports = detect_serial_ports()
+        if not ports:
+            print("\nError: No real serial ports were detected.")
+            print("Please ensure your device is connected and you have the correct permissions.")
+            return None
+        print("\nPlease select the serial device to connect to:")
+        for i, port in enumerate(ports, 1):
+            print(f"  [{i}] {port}")
+        port_choice = input(f"Enter number (1-{len(ports)}): ").strip()
+        if not port_choice.isdigit() or not (1 <= int(port_choice) <= len(ports)):
+            print("Invalid selection.")
+            return None
+        selected_port = ports[int(port_choice) - 1]
+        print(f"\n> You selected: Real serial device '{selected_port}'")
+    else:  # choice == "2"
+        selected_port = None
+        print("\n> You selected: Internal bridge mode.")
+        print("> A new virtual serial port will be created.")
+        print("> The backend script should connect to this new port path.")
+
+    baud_text = input("Baudrate [115200]: ").strip()
+    baudrate = int(baud_text) if baud_text.isdigit() else 115200
+    print(f"> Using baudrate: {baudrate}")
+
+    if choice == "1":
+        return StartupConfig(mode="serial", port=selected_port, baudrate=baudrate)
+    return StartupConfig(mode="bridge", port=None, baudrate=baudrate)
+
+
+def print_help() -> None:
+    print("\n" + "=" * 60)
+    print("SERIAL MONITOR HELP")
+    print("=" * 60)
+    print("This script emulates the robot's serial interface for testing the backend.")
+    print()
+    print("How to send a text command to the backend:")
+    print("  1. Run this script and connect it to the backend (either via a real serial")
+    print("     port or the internal bridge).")
+    print("  2. The script will prompt you with '[tx TEXT] Enter text...'")
+    print("  3. Type your message and press Enter.")
+    print("  4. The script will format it as a 'TEXT,<your_message>' packet and send it.")
+    print("  5. Monitor the output for ANIM and AUDIO packets from the backend.")
+    print()
+    print("You can also send a one-off text packet from the command line:")
+    print("  python3 serial_io_test_client.py --port /dev/pts/X --send-text 'hello world'")
+    print()
+    print("Packet types:")
+    print("  POS     - Face position data (x_error, y_error, confidence)")
+    print("  STAT    - Servo status (servo_us, millis)")
+    print("  ANIM    - Animation response from backend (animation, text)")
+    print("  AUDIO   - Audio data (base64 encoded)")
+    print("  TEXT    - Text input for LLM processing")
+    print("  DEBUG   - Debug messages")
+    print()
+    print("Display presets:")
+    print("  1 (all)          - Show all packet types")
+    print("  2 (tracking)     - Show POS + STAT (face tracking)")
+    print("  3 (audio_test)   - Show TEXT + ANIM + AUDIO (LLM/audio testing)")
+    print("  4 (custom)       - Enter custom packet types")
+    print()
+    print("During monitoring:")
+    print("  Ctrl+C           - Stop and change options")
+    print("=" * 60 + "\n")
+
+
+def ask_display_kinds_interactive() -> tuple[Optional[List[str]], bool]:
+    print("\n" + "-" * 20)
+    print("Step 2: Select Packets to Display")
+    print("-" * 20)
+    print("Choose a preset to filter which serial packets are shown.")
+    print("  1) All          - Show all packets (useful for general debugging).")
+    print("  2) Tracking     - Show POS and STAT packets (for face tracking testing).")
+    print("  3) LLM/Audio    - Show TEXT, ANIM, and AUDIO packets (for AI testing).")
+    print("  4) Custom       - Manually enter a list of packet types to show.")
+    choice = _ask_choice("Select preset [1/2/3/4]: ", {"1", "2", "3", "4"})
+
+    enable_text_input = False
+    kinds: Optional[List[str]] = None
+
+    if choice == "1":
+        print("> Displaying all packets.")
+        kinds = None
+    elif choice == "2":
+        print("> Displaying: POS, STAT")
+        kinds = ["POS", "STAT"]
+    elif choice == "3":
+        print("> Displaying: TEXT, ANIM, AUDIO")
+        kinds = ["TEXT", "ANIM", "AUDIO"]
+        enable_text_input = True
+        print("> Text input prompt will be enabled for LLM testing.")
+    else:  # choice == "4": custom
+        print("\nEnter comma-separated packet types (e.g., POS, STAT, ANIM, AUDIO, TEXT, DEBUG):")
+        txt = input("Types: ").strip()
+        if not txt:
+            print("> No types entered, will display all packets.")
+            kinds = None
+        else:
+            kinds = [p.strip().upper() for p in txt.split(",") if p.strip()]
+            print(f"> Displaying: {', '.join(kinds)}")
+            if "TEXT" in kinds:
+                enable_text_input = True
+                print("> Text input prompt will be enabled because 'TEXT' is in the custom list.")
+
+    if not enable_text_input:
+        print("\n" + "-" * 20)
+        print("Step 3: Enable Text Input")
+        print("-" * 20)
+        print("Enable a prompt to send TEXT packets to the backend for LLM testing?")
+        print("  y) Yes - Show a prompt to send text during monitoring.")
+        print("  n) No  - Do not show the text input prompt.")
+        text_choice = _ask_choice("Select [y/n]: ", {"y", "n"})
+        if text_choice == "y":
+            enable_text_input = True
+            print("> Text input prompt enabled.")
+
+    return kinds, enable_text_input
+
+
+def start_input_thread(monitor: SerialMonitor) -> threading.Thread:
+    """Start a background thread to read text input from the user."""
+    def _input_loop():
+        while monitor.running:
+            try:
+                line = input("  [tx TEXT] Enter text and press Enter (empty to skip): ").strip()
+                if line:
+                    print(colorize(f"[input] {line}", Ansi.BLUE))
+                    monitor.send_text_packet(line)
+            except EOFError:
+                break
+            except KeyboardInterrupt:
+                break
+
+    t = threading.Thread(target=_input_loop, daemon=True)
+    t.start()
+    return t
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Serial packet monitor for the face-tracking backend")
     parser.add_argument("--port", type=str, default=None, help="Serial port path (real device or bridge slave)")
     parser.add_argument("--baudrate", type=int, default=115200, help="Serial baudrate")
     parser.add_argument("--list-ports", action="store_true", help="List detected serial ports and exit")
     parser.add_argument("--bridge", action="store_true", help="Create an internal pseudo-TTY bridge for backend testing")
+    parser.add_argument("--send-text", type=str, default=None, help="Send a TEXT,<text> packet to specified --port and exit (for testing LLM flow)")
+    parser.add_argument("--help-info", action="store_true", help="Show help and exit")
     args = parser.parse_args()
+
+    if args.help_info:
+        print_help()
+        return
+
+    # No --help-info, so don't print it unless requested.
+    # print_help()
 
     if args.list_ports:
         ports = detect_serial_ports()
@@ -335,20 +536,103 @@ def main() -> None:
             args.port = config.port
             args.baudrate = config.baudrate
 
+    # If --send-text is used we simply write the TEXT packet to the given port and exit
+    if args.send_text is not None:
+        if not args.port:
+            print("--send-text requires --port to be specified (the tty path to write into).")
+            return
+        payload = f"TEXT,{args.send_text}\n"
+        try:
+            # write raw bytes to the device path
+            with open(args.port, "wb", buffering=0) as f:
+                f.write(payload.encode("utf-8"))
+            print(f"Wrote TEXT packet to {args.port}")
+        except Exception as exc:
+            print(f"Failed to write to {args.port}: {exc}")
+        return
+
     monitor = SerialMonitor(port=args.port, baudrate=args.baudrate)
+    enable_text_input = False
+    # initial display kinds (interactive prompt if running interactively)
+    if sys.stdin.isatty():
+        kinds, enable_text_input = ask_display_kinds_interactive()
+        monitor.set_display_kinds(kinds)
+
+    input_thread = None
     try:
-        if args.bridge:
-            slave = monitor.create_bridge()
-            print(f"[bridge] connect backend to: {slave}")
-            monitor.start()
-        else:
-            if args.port is None:
-                print("No serial port specified. Re-run with no flags for interactive selection.")
-                return
-            monitor.connect()
-            monitor.start()
-    except KeyboardInterrupt:
-        print("\n[stopped]")
+        while True:
+            try:
+                if args.bridge:
+                    slave = monitor.create_bridge()
+                    print(f"\n[bridge] connect backend to: {slave}")
+                    print("[bridge] Press Ctrl+C to change options")
+                else:
+                    if args.port is None:
+                        print("No serial port specified. Re-run with no flags for interactive selection.")
+                        return
+                    print(f"\n[serial] Press Ctrl+C to change options")
+                # Run the monitor in the background when text input is enabled so the main
+                # terminal can reliably accept typed TEXT packets.
+                if sys.stdin.isatty() and enable_text_input:
+                    if input_thread is None:
+                        monitor_thread = threading.Thread(target=monitor.start, daemon=True)
+                        monitor_thread.start()
+                        input_thread = monitor_thread
+                    print(colorize("Type text below and press Enter to send TEXT packets to the backend.", Ansi.DIM))
+                    while True:
+                        if not monitor_thread.is_alive() and not monitor.running:
+                            print(colorize("[monitor] reader loop stopped.", Ansi.RED))
+                            break
+                        try:
+                            line = input(colorize("[tx TEXT] > ", Ansi.BLUE)).strip()
+                        except EOFError:
+                            break
+                        except KeyboardInterrupt:
+                            raise
+                        if line:
+                            print(colorize(f"[input] {line}", Ansi.BLUE))
+                            monitor.send_text_packet(line)
+                    monitor.close()
+                else:
+                    monitor.start()
+                # normal exit from monitor (not Ctrl+C)
+                break
+            except KeyboardInterrupt:
+                print("\n[stopped] — interrupted")
+                # allow user to change filters or reselect startup
+                if not sys.stdin.isatty():
+                    break
+                print("Options: [f] change filters  [s] reselect startup  [q] quit")
+                action = input("Choice [f/s/q]: ").strip().lower()
+                if action == "q":
+                    monitor.close()
+                    break
+                if action == "f":
+                    kinds, enable_text_input = ask_display_kinds_interactive()
+                    monitor.set_display_kinds(kinds)
+                    # restart reading with same connection; set running True and loop
+                    monitor.running = True
+                    continue
+                if action == "s":
+                    monitor.close()
+                    cfg = choose_startup_configuration()
+                    if cfg is None:
+                        break
+                    if cfg.mode == "bridge":
+                        args.bridge = True
+                        args.baudrate = cfg.baudrate
+                        args.port = None
+                    else:
+                        args.bridge = False
+                        args.port = cfg.port
+                        args.baudrate = cfg.baudrate
+                    monitor = SerialMonitor(port=args.port, baudrate=args.baudrate)
+                    kinds, enable_text_input = ask_display_kinds_interactive()
+                    monitor.set_display_kinds(kinds)
+                    continue
+                # unknown option -> quit
+                monitor.close()
+                break
     finally:
         monitor.close()
 
