@@ -1,215 +1,267 @@
-# Python Backend and Serial Testing
+# Python Backend: Documentation and Hardware Implementation
 
-This folder contains the face-tracking backend and the serial packet monitor used to test Arduino communication.
+This folder contains the complete backend stack for face tracking, serial communication, and optional local STT + LLM + TTS response generation.
 
-## Files
+## Contents
 
-- [face_tracking_test.py](face_tracking_test.py) — camera + face detection backend
-- [serial_io_test_client.py](serial_io_test_client.py) — serial monitor and bridge helper
+- `face_tracking_test.py`: Main backend (camera, MediaPipe face tracking, serial protocol, optional LLM pipeline)
+- `serial_io_test_client.py`: Test client (serial monitor, bridge mode, text prompt injection for LLM tests)
+- `api_key_openrouterai`: OpenRouter API key file (plain text key, one line)
 
----
+## System Overview
 
-## Install
+The project supports two main functions:
 
-From the project root:
+1. Face tracking loop:
+- Detect largest face in webcam frame
+- Send normalized error vector via serial: `POS,<x_error>,<y_error>,<confidence>`
+
+2. LLM/audio loop (optional):
+- Backend receives `TEXT,<message>` (or `AUDIO,<base64>`)
+- Uses OpenRouter LLM
+- Produces structured response (`animation`, `text`)
+- Synthesizes speech to WAV (espeak first, pyttsx3 fallback)
+- Sends back `ANIM,...` and `AUDIO,...` packets
+
+## Requirements
+
+Use Python 3.10+ on Linux.
+
+### Python packages
 
 ```bash
-python3 -m venv DEV/python_backend/.venv
-source DEV/python_backend/.venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install opencv-contrib-python==4.10.0.84 mediapipe==0.10.14 numpy==1.26.4 pyserial
+pip install opencv-contrib-python==4.10.0.84 mediapipe==0.10.14 numpy==1.26.4
+pip install pyserial requests openai-whisper pyttsx3
 ```
 
-Required packages:
-- opencv-contrib-python
-- mediapipe
-- numpy
-- pyserial
+### System packages (recommended)
 
----
+```bash
+sudo apt-get update
+sudo apt-get install -y python3-tk espeak ffmpeg
+```
 
-## Backend: face_tracking_test.py
+Notes:
+- `python3-tk` is required for backend startup GUI.
+- `espeak` is preferred TTS backend (most reliable on Linux).
+- `pyttsx3` may install successfully but still fail at runtime depending on speech backend availability.
 
-The backend detects the largest face and sends a normalized position packet to the serial device:
+## OpenRouter API Setup
+
+Create `api_key_openrouterai` in this folder with your key:
 
 ```text
-POS,<x_error>,<y_error>,<confidence>\n
+sk-or-v1-...
 ```
 
-### Example
+Backend endpoint in use:
+- `https://openrouter.ai/api/v1/chat/completions`
 
-```text
-POS,0.1250,-0.2500,0.91
-```
+If you see DNS/network errors, verify internet access and DNS configuration.
 
-- `x_error`: horizontal offset from center, normalized to roughly `-1.0 .. +1.0`
-- `y_error`: vertical offset from center, normalized to roughly `-1.0 .. +1.0`
-- `confidence`: face detection confidence from MediaPipe
+## Backend Startup
 
-### Run
+Run from `DEV/python_backend`:
 
 ```bash
 python face_tracking_test.py
 ```
 
-A startup window lets you choose:
-- camera
-- resolution
-- face detector mode
-- serial port
-- baudrate
+The GUI allows selecting:
+- Camera
+- Resolution
+- Distance mode (short-range / full-range)
+- Serial port or manual tty path
+- Baudrate
+- Enable LLM checkbox
+- Terminal log display preset
 
-### Flags
+### Log display presets (backend GUI)
 
-- `--max-cameras N`
-  - Number of camera indices to probe.
-- `--camera-index N`
-  - Skip the selector and open one camera directly.
-- `--model-selection 0|1`
-  - `0` = short-range detector, `1` = full-range detector.
-- `--min-detection-confidence FLOAT`
-  - Minimum confidence threshold.
-- `--serial-port PATH`
-  - Serial device path for Arduino or a virtual tty.
-- `--serial-baudrate N`
-  - Serial baudrate, default `115200`.
+Same style as test client presets:
+- `All`
+- `Tracking`
+- `LLM/Audio`
+- `Custom` (comma-separated kinds)
 
-### Virtual / test interfaces
+Log output is color-coded in terminal for readability.
 
-The backend can use a virtual tty path such as `/dev/pts/7`.
+### CLI flags (backend)
 
-Ways to select it:
-- type it manually in the startup window
-- pass it with `--serial-port /dev/pts/7`
+```bash
+python face_tracking_test.py \
+  --camera-index 0 \
+  --model-selection 0 \
+  --min-detection-confidence 0.5 \
+  --serial-port /dev/ttyUSB0 \
+  --serial-baudrate 115200 \
+  --enable-llm
+```
 
----
+Available flags:
+- `--max-cameras`
+- `--camera-index`
+- `--model-selection {0,1}`
+- `--min-detection-confidence`
+- `--serial-port`
+- `--serial-baudrate`
+- `--enable-llm`
+- `--help-backend`
 
-## Serial Monitor: serial_io_test_client.py
+## Test Client Startup
 
-This script prints and decodes packets from the backend or Arduino.
-
-### Start with no flags
-
-Run the monitor without any flags to open the startup selector:
+Run:
 
 ```bash
 python serial_io_test_client.py
 ```
 
-You can then choose:
-- real serial device
-- internal bridge mode
-- baudrate
-- manual tty path or detected interface
+Interactive flow:
+1. Select mode (`Real serial` or `Internal bridge`)
+2. Select display preset (`All`, `Tracking`, `LLM/Audio`, `Custom`)
+3. Optional text input prompt enable
 
-### Packet formats
+When text input is enabled:
+- Type at `[tx TEXT] >`
+- Client shows `[input] ...`
+- Packet is sent directly to backend
+- Receive and decode backend responses in same terminal
 
-#### Position packet from backend
-```text
-POS,<x_error>,<y_error>,<confidence>\n
-```
+Output is color-coded for readability.
 
-#### Status packet from Arduino
-```text
-STAT,<servo_us>,<millis>\n
-```
+## Serial Protocol
 
-#### Debug line
-```text
-[anything starting with [ ]
-```
+All packets are ASCII lines ending with `\n`.
 
-### Example output
+### Backend -> Arduino/Test Client
+
+1. Face tracking:
 
 ```text
-[rx ✓] POS     | x=+0.1250 y=-0.2500 conf=0.91
-[rx ✓] STAT    | servo_us=1500 millis=42
-[rx ✓] DEBUG   | [mock] ready
+POS,<x_error>,<y_error>,<confidence>
 ```
 
-### Flags
+2. LLM response metadata:
 
-- `--port PATH`
-  - Open a real serial port or a bridge slave tty.
-- `--baudrate N`
-  - Serial baudrate, default `115200`.
-- `--list-ports`
-  - Show detected serial devices.
-- `--bridge`
-  - Create an internal pseudo-TTY bridge for backend testing.
-
-If you do not pass any flags, the script opens an interactive selector first.
-
-### Bridge mode
-
-Use this when you want to test the backend without an Arduino.
-
-1. Start the monitor with no flags.
-2. Choose **internal bridge** in the startup selector.
-3. It prints a slave tty path like `/dev/pts/7`.
-4. Start the backend with that path:
-  ```bash
-  python face_tracking_test.py --serial-port /dev/pts/7
-  ```
-5. The monitor will print the packets that the backend writes.
-
-### Real serial mode
-
-```bash
-python serial_io_test_client.py --port /dev/ttyUSB0
-```
-
-This is useful for observing an Arduino directly.
-
----
-
-## Serial protocol summary
-
-### Backend to Arduino
 ```text
-POS,<x_error>,<y_error>,<confidence>\n
+ANIM,<animation>,<text>
 ```
 
-Meaning:
-- `x_error < 0` means the face is left of center
-- `x_error > 0` means the face is right of center
-- `y_error < 0` means the face is above center
-- `y_error > 0` means the face is below center
-- `confidence` is the detection confidence
+3. Audio payload chunks:
 
-### Arduino to monitor
 ```text
-STAT,<servo_us>,<millis>\n
+AUDIO,<base64_chunk>
 ```
 
-Optional debug lines may also appear.
+### Arduino/Test Client -> Backend
 
----
+1. Text prompt:
 
-## Recommended workflows
+```text
+TEXT,<user_message>
+```
 
-### 1) No Arduino, internal bridge
+2. Optional audio input:
+
+```text
+AUDIO,<base64_audio>
+```
+
+### Optional status/debug from Arduino
+
+```text
+STAT,<servo_us>,<millis>
+[debug text...]
+```
+
+## Hardware Implementation Guide (Arduino + Servos)
+
+The backend is hardware-agnostic, but expected behavior is:
+
+1. Arduino opens serial at same baudrate as backend (default `115200`).
+2. Arduino parses incoming `POS` continuously.
+3. Convert `x_error` and `y_error` to servo target offsets with clamp/rate limits.
+4. Optional: send `STAT` periodically for monitoring.
+5. For interaction mode, Arduino sends `TEXT,<message>` to backend.
+6. Arduino handles returned `ANIM` and `AUDIO` packets (playback pipeline is device-specific).
+
+### Recommended control logic on hardware
+
+- Apply smoothing/filtering to reduce jitter.
+- Clamp command range before servo write.
+- Add deadzone around zero to avoid servo hunting.
+- Keep watchdog timeout for lost `POS` packets.
+
+## Recommended Workflows
+
+### A) Full software test without hardware (bridge mode)
+
+1. Start test client:
+
 ```bash
 python serial_io_test_client.py
-# choose internal bridge
-# copy the printed /dev/pts/X path
-python face_tracking_test.py --serial-port /dev/pts/X
 ```
 
-### 2) Real Arduino
+2. Choose `Internal bridge`; copy printed `/dev/pts/X`.
+
+3. Start backend and set serial port to that `/dev/pts/X` in GUI (or via CLI):
+
 ```bash
-python face_tracking_test.py --serial-port /dev/ttyUSB0
+python face_tracking_test.py --serial-port /dev/pts/X --enable-llm
 ```
 
-### 3) Observe a device directly
+4. In test client LLM mode, type text and verify `ANIM` + `AUDIO` replies.
+
+### B) Real hardware run
+
+1. Connect Arduino and servos.
+2. Identify serial device (`/dev/ttyUSB0`, `/dev/ttyACM0`, etc.).
+3. Start backend with that port and optional `--enable-llm`.
+4. Use test client only when needed (do not open same serial port in two apps simultaneously).
+
+## Troubleshooting
+
+### 1) No Start button in backend GUI
+
+- Use latest version from this folder.
+- Ensure `python3-tk` is installed.
+- If GUI unavailable, script falls back to terminal selection.
+
+### 2) `TEXT` sent but no response
+
+- Ensure backend `Enable LLM` is active.
+- Ensure backend and test client are connected to the same tty/bridge.
+- Check API key file exists and is valid.
+- Verify network access to OpenRouter endpoint.
+
+### 3) `[TTS] No local TTS engine available`
+
+- Install `espeak` and retest.
+- If using `pyttsx3`, inspect detailed runtime error now printed by backend.
+
+### 4) Port busy / cannot connect
+
+- Only one process can open a serial device at a time.
+- Close other serial monitors before starting backend.
+
+## Quick Command Reference
+
 ```bash
-python serial_io_test_client.py --port /dev/ttyUSB0
+# Activate env
+source .venv/bin/activate
+
+# Backend GUI mode
+python face_tracking_test.py
+
+# Backend CLI mode
+python face_tracking_test.py --camera-index 0 --serial-port /dev/ttyUSB0 --enable-llm
+
+# Test client interactive
+python serial_io_test_client.py
+
+# Test client one-shot text send
+python serial_io_test_client.py --port /dev/pts/X --send-text "hello robot"
 ```
-
----
-
-## Notes
-
-- The serial port can only be opened by one process at a time.
-- Bridge mode is the easiest way to test backend output without an Arduino.
-- The monitor script only prints packets; it does not move servos itself.
