@@ -1,11 +1,11 @@
 # Python Backend: Documentation and Hardware Implementation
 
-This folder contains the complete backend stack for face tracking, serial communication, and optional local STT + LLM + TTS response generation.
+This folder contains the backend stack for face tracking, serial communication (POS + ANIM only), and local STT + LLM + TTS on the PC.
 
 ## Contents
 
-- `face_tracking_test.py`: Main backend (camera, MediaPipe face tracking, serial protocol, optional LLM pipeline)
-- `serial_io_test_client.py`: Test client (serial monitor, bridge mode, text prompt injection for LLM tests)
+- `face_tracking_test.py`: Main backend (camera, MediaPipe face tracking, serial POS/ANIM, local STT/LLM/TTS)
+- `serial_io_test_client.py`: Test client (read-only serial monitor, bridge mode)
 - `api_key_openrouterai`: OpenRouter API key file (plain text key, one line)
 
 ## System Overview
@@ -16,12 +16,13 @@ The project supports two main functions:
 - Detect largest face in webcam frame
 - Send normalized error vector via serial: `POS,<x_error>,<y_error>,<confidence>`
 
-2. LLM/audio loop (optional):
-- Backend receives `TEXT,<message>` (or `AUDIO,<base64>`)
+2. LLM/audio loop (local on PC):
+- Microphone is captured locally (ALSA `arecord`)
 - Uses OpenRouter LLM
 - Produces structured response (`animation`, `text`)
 - Synthesizes speech to WAV (espeak first, pyttsx3 fallback)
-- Sends back `ANIM,...` and `AUDIO,...` packets
+- Plays audio locally on the PC
+- Sends `ANIM,<animation>,<text>` over serial (no audio over serial)
 
 ## Requirements
 
@@ -41,12 +42,13 @@ pip install pyserial requests openai-whisper pyttsx3
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y python3-tk espeak ffmpeg
+sudo apt-get install -y python3-tk espeak ffmpeg alsa-utils
 ```
 
 Notes:
 - `python3-tk` is required for backend startup GUI.
 - `espeak` is preferred TTS backend (most reliable on Linux).
+- `alsa-utils` provides `arecord` for microphone capture.
 - `pyttsx3` may install successfully but still fail at runtime depending on speech backend availability.
 
 ## OpenRouter API Setup
@@ -76,7 +78,7 @@ The GUI allows selecting:
 - Distance mode (short-range / full-range)
 - Serial port or manual tty path
 - Baudrate
-- Enable LLM checkbox
+- ALSA capture device string (default `hw:1,0`)
 - Terminal log display preset
 
 ### Log display presets (backend GUI)
@@ -97,8 +99,7 @@ python face_tracking_test.py \
   --model-selection 0 \
   --min-detection-confidence 0.5 \
   --serial-port /dev/ttyUSB0 \
-  --serial-baudrate 115200 \
-  --enable-llm
+  --serial-baudrate 115200
 ```
 
 Available flags:
@@ -108,7 +109,6 @@ Available flags:
 - `--min-detection-confidence`
 - `--serial-port`
 - `--serial-baudrate`
-- `--enable-llm`
 - `--help-backend`
 
 ## Test Client Startup
@@ -122,13 +122,6 @@ python serial_io_test_client.py
 Interactive flow:
 1. Select mode (`Real serial` or `Internal bridge`)
 2. Select display preset (`All`, `Tracking`, `LLM/Audio`, `Custom`)
-3. Optional text input prompt enable
-
-When text input is enabled:
-- Type at `[tx TEXT] >`
-- Client shows `[input] ...`
-- Packet is sent directly to backend
-- Receive and decode backend responses in same terminal
 
 Output is color-coded for readability.
 
@@ -150,26 +143,6 @@ POS,<x_error>,<y_error>,<confidence>
 ANIM,<animation>,<text>
 ```
 
-3. Audio payload chunks:
-
-```text
-AUDIO,<base64_chunk>
-```
-
-### Arduino/Test Client -> Backend
-
-1. Text prompt:
-
-```text
-TEXT,<user_message>
-```
-
-2. Optional audio input:
-
-```text
-AUDIO,<base64_audio>
-```
-
 ### Optional status/debug from Arduino
 
 ```text
@@ -185,8 +158,8 @@ The backend is hardware-agnostic, but expected behavior is:
 2. Arduino parses incoming `POS` continuously.
 3. Convert `x_error` and `y_error` to servo target offsets with clamp/rate limits.
 4. Optional: send `STAT` periodically for monitoring.
-5. For interaction mode, Arduino sends `TEXT,<message>` to backend.
-6. Arduino handles returned `ANIM` and `AUDIO` packets (playback pipeline is device-specific).
+5. For interaction mode, Arduino listens for `ANIM,<animation>,<text>` only.
+6. Audio playback is local on the PC (no audio packets over serial).
 
 ### Recommended control logic on hardware
 
@@ -213,13 +186,13 @@ python serial_io_test_client.py
 python face_tracking_test.py --serial-port /dev/pts/X --enable-llm
 ```
 
-4. In test client LLM mode, type text and verify `ANIM` + `AUDIO` replies.
+4. Verify `ANIM` replies in the test client.
 
 ### B) Real hardware run
 
 1. Connect Arduino and servos.
 2. Identify serial device (`/dev/ttyUSB0`, `/dev/ttyACM0`, etc.).
-3. Start backend with that port and optional `--enable-llm`.
+3. Start backend with that port.
 4. Use test client only when needed (do not open same serial port in two apps simultaneously).
 
 ## Troubleshooting
@@ -230,9 +203,8 @@ python face_tracking_test.py --serial-port /dev/pts/X --enable-llm
 - Ensure `python3-tk` is installed.
 - If GUI unavailable, script falls back to terminal selection.
 
-### 2) `TEXT` sent but no response
+### 2) No `ANIM` received
 
-- Ensure backend `Enable LLM` is active.
 - Ensure backend and test client are connected to the same tty/bridge.
 - Check API key file exists and is valid.
 - Verify network access to OpenRouter endpoint.
@@ -257,11 +229,11 @@ source .venv/bin/activate
 python face_tracking_test.py
 
 # Backend CLI mode
-python face_tracking_test.py --camera-index 0 --serial-port /dev/ttyUSB0 --enable-llm
+python face_tracking_test.py --camera-index 0 --serial-port /dev/ttyUSB0
 
 # Test client interactive
 python serial_io_test_client.py
 
-# Test client one-shot text send
-python serial_io_test_client.py --port /dev/pts/X --send-text "hello robot"
+# Test client (read-only)
+python serial_io_test_client.py --port /dev/pts/X
 ```

@@ -492,13 +492,23 @@ def play_audio_bytes(audio_bytes: bytes) -> bool:
     return False
 
 
-def start_chat_window() -> None:
+def start_chat_window(serial_port: Optional[str], serial_baudrate: int) -> None:
     try:
         import tkinter as tk
         from tkinter import messagebox
     except Exception as exc:
         log_line("ERROR", f"[Chat] Tkinter not available: {exc}", always=True)
         return
+
+    serial_ctrl: Optional[SerialController] = None
+    if serial_port:
+        try:
+            serial_ctrl = SerialController(port=serial_port, baudrate=serial_baudrate)
+            if not serial_ctrl.connect():
+                serial_ctrl = None
+        except Exception as exc:
+            log_line("ERROR", f"[Chat] serial init failed: {exc}", always=True)
+            serial_ctrl = None
 
     root = tk.Tk()
     root.title("LLM Chat")
@@ -516,13 +526,17 @@ def start_chat_window() -> None:
         if not txt:
             messagebox.showinfo("Empty", "Enter a message first")
             return
-        threading.Thread(target=lambda: handle_incoming_text(txt), daemon=True).start()
+        threading.Thread(target=lambda: handle_incoming_text(txt, serial_ctrl), daemon=True).start()
 
     btn_frame = tk.Frame(root)
     btn_frame.pack(fill="x", padx=8, pady=(0, 8))
     tk.Button(btn_frame, text="Send to LLM", command=send_llm_text_now).pack(side="right", padx=4)
     tk.Button(btn_frame, text="Close", command=root.destroy).pack(side="right")
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        if serial_ctrl:
+            serial_ctrl.disconnect()
 
 
 def handle_incoming_text(user_text: str, serial_ctrl: Optional[SerialController] = None) -> None:
@@ -1115,7 +1129,7 @@ def main() -> None:
         serial_baudrate = args.serial_baudrate
 
     if mic_device is None:
-        proc = multiprocessing.Process(target=start_chat_window)
+        proc = multiprocessing.Process(target=start_chat_window, args=(serial_port, serial_baudrate))
         proc.daemon = False
         proc.start()
 

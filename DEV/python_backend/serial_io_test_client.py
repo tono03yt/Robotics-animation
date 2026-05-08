@@ -33,7 +33,6 @@ POS_RE = re.compile(r"^POS,(-?[\d.]+),(-?[\d.]+),([\d.]+)$")
 STAT_RE = re.compile(r"^STAT,(\d+),(\d+)$")
 ANIM_RE = re.compile(r"^ANIM,(\w+),(.*)$")
 AUDIO_RE = re.compile(r"^AUDIO,(.+)$")
-TEXT_RE = re.compile(r"^TEXT,(.*)$")
 DEBUG_RE = re.compile(r"^\[")
 
 
@@ -114,10 +113,6 @@ def parse_packet(line: str) -> Packet:
         b64 = match.group(1)
         return Packet(True, "AUDIO", {"base64_len": len(b64)}, line)
 
-    match = TEXT_RE.match(line)
-    if match:
-        return Packet(True, "TEXT", {"text": match.group(1)}, line)
-
     if "," in line:
         prefix = line.split(",", 1)[0] or "UNKNOWN"
         return Packet(False, prefix, {"error": "unrecognized packet"}, line)
@@ -138,8 +133,6 @@ class SerialMonitor:
         self.by_kind: Dict[str, int] = {}
         # None = show all; otherwise a set of kinds to display (e.g. {"POS","STAT"})
         self.display_kinds: Optional[set[str]] = None
-        self.input_queue: List[str] = []
-        self.input_lock = threading.Lock()
 
     def create_bridge(self) -> str:
         master_fd, slave_fd = pty.openpty()
@@ -188,8 +181,6 @@ class SerialMonitor:
             print(f"{colorize('[rx]', Ansi.CYAN)} {status} {colorize('ANIM', Ansi.MAGENTA):<14} | animation={packet.fields['animation']} text={packet.fields['text']}")
         elif packet.kind == "AUDIO":
             print(f"{colorize('[rx]', Ansi.CYAN)} {status} {colorize('AUDIO', Ansi.GREEN):<14} | base64_len={packet.fields['base64_len']}")
-        elif packet.kind == "TEXT":
-            print(f"{colorize('[rx]', Ansi.CYAN)} {status} {colorize('TEXT', Ansi.BLUE):<14} | {packet.fields['text']}")
         elif packet.kind == "DEBUG":
             print(f"{colorize('[rx]', Ansi.CYAN)} {status} {colorize('DEBUG', Ansi.DIM):<14} | {packet.fields['text']}")
         else:
@@ -262,28 +253,8 @@ class SerialMonitor:
         for kind, count in sorted(self.by_kind.items()):
             print(f"  {kind}: {count}")
 
-    def queue_text_input(self, text: str) -> None:
-        with self.input_lock:
-            self.input_queue.append(text)
-
-    def send_text_packet(self, text: str) -> bool:
-        payload = f"TEXT,{text}\n"
-        sent = False
-        if self.serial and self.serial.is_open:
-            self.serial.write(payload.encode("utf-8"))
-            sent = True
-        elif self.master_fd is not None:
-            os.write(self.master_fd, payload.encode("utf-8"))
-            sent = True
-        if not sent:
-            print(colorize(f"[tx] TEXT dropped (no active serial target): {text}", Ansi.RED))
-        return sent
-
     def _flush_input_queue(self) -> None:
-        with self.input_lock:
-            for text in self.input_queue:
-                self.send_text_packet(text)
-            self.input_queue.clear()
+        return
 
     def set_display_kinds(self, kinds: Optional[List[str]]) -> None:
         if kinds is None:
@@ -390,29 +361,19 @@ def print_help() -> None:
     print("=" * 60)
     print("This script emulates the robot's serial interface for testing the backend.")
     print()
-    print("How to send a text command to the backend:")
-    print("  1. Run this script and connect it to the backend (either via a real serial")
-    print("     port or the internal bridge).")
-    print("  2. The script will prompt you with '[tx TEXT] Enter text...'")
-    print("  3. Type your message and press Enter.")
-    print("  4. The script will format it as a 'TEXT,<your_message>' packet and send it.")
-    print("  5. Monitor the output for ANIM and AUDIO packets from the backend.")
-    print()
-    print("You can also send a one-off text packet from the command line:")
-    print("  python3 serial_io_test_client.py --port /dev/pts/X --send-text 'hello world'")
+    print("This client is read-only: it listens for serial packets from the backend.")
     print()
     print("Packet types:")
     print("  POS     - Face position data (x_error, y_error, confidence)")
     print("  STAT    - Servo status (servo_us, millis)")
     print("  ANIM    - Animation response from backend (animation, text)")
     print("  AUDIO   - Audio data (base64 encoded)")
-    print("  TEXT    - Text input for LLM processing")
     print("  DEBUG   - Debug messages")
     print()
     print("Display presets:")
     print("  1 (all)          - Show all packet types")
     print("  2 (tracking)     - Show POS + STAT (face tracking)")
-    print("  3 (audio_test)   - Show TEXT + ANIM + AUDIO (LLM/audio testing)")
+    print("  3 (audio_test)   - Show ANIM + AUDIO (LLM/audio testing)")
     print("  4 (custom)       - Enter custom packet types")
     print()
     print("During monitoring:")
@@ -431,7 +392,6 @@ def ask_display_kinds_interactive() -> tuple[Optional[List[str]], bool]:
     print("  4) Custom       - Manually enter a list of packet types to show.")
     choice = _ask_choice("Select preset [1/2/3/4]: ", {"1", "2", "3", "4"})
 
-    enable_text_input = False
     kinds: Optional[List[str]] = None
 
     if choice == "1":
@@ -441,10 +401,8 @@ def ask_display_kinds_interactive() -> tuple[Optional[List[str]], bool]:
         print("> Displaying: POS, STAT")
         kinds = ["POS", "STAT"]
     elif choice == "3":
-        print("> Displaying: TEXT, ANIM, AUDIO")
-        kinds = ["TEXT", "ANIM", "AUDIO"]
-        enable_text_input = True
-        print("> Text input prompt will be enabled for LLM testing.")
+        print("> Displaying: ANIM, AUDIO")
+        kinds = ["ANIM", "AUDIO"]
     else:  # choice == "4": custom
         print("\nEnter comma-separated packet types (e.g., POS, STAT, ANIM, AUDIO, TEXT, DEBUG):")
         txt = input("Types: ").strip()
@@ -454,42 +412,7 @@ def ask_display_kinds_interactive() -> tuple[Optional[List[str]], bool]:
         else:
             kinds = [p.strip().upper() for p in txt.split(",") if p.strip()]
             print(f"> Displaying: {', '.join(kinds)}")
-            if "TEXT" in kinds:
-                enable_text_input = True
-                print("> Text input prompt will be enabled because 'TEXT' is in the custom list.")
-
-    if not enable_text_input:
-        print("\n" + "-" * 20)
-        print("Step 3: Enable Text Input")
-        print("-" * 20)
-        print("Enable a prompt to send TEXT packets to the backend for LLM testing?")
-        print("  y) Yes - Show a prompt to send text during monitoring.")
-        print("  n) No  - Do not show the text input prompt.")
-        text_choice = _ask_choice("Select [y/n]: ", {"y", "n"})
-        if text_choice == "y":
-            enable_text_input = True
-            print("> Text input prompt enabled.")
-
-    return kinds, enable_text_input
-
-
-def start_input_thread(monitor: SerialMonitor) -> threading.Thread:
-    """Start a background thread to read text input from the user."""
-    def _input_loop():
-        while monitor.running:
-            try:
-                line = input("  [tx TEXT] Enter text and press Enter (empty to skip): ").strip()
-                if line:
-                    print(colorize(f"[input] {line}", Ansi.BLUE))
-                    monitor.send_text_packet(line)
-            except EOFError:
-                break
-            except KeyboardInterrupt:
-                break
-
-    t = threading.Thread(target=_input_loop, daemon=True)
-    t.start()
-    return t
+    return kinds, False
 
 
 def main() -> None:
@@ -498,7 +421,6 @@ def main() -> None:
     parser.add_argument("--baudrate", type=int, default=115200, help="Serial baudrate")
     parser.add_argument("--list-ports", action="store_true", help="List detected serial ports and exit")
     parser.add_argument("--bridge", action="store_true", help="Create an internal pseudo-TTY bridge for backend testing")
-    parser.add_argument("--send-text", type=str, default=None, help="Send a TEXT,<text> packet to specified --port and exit (for testing LLM flow)")
     parser.add_argument("--help-info", action="store_true", help="Show help and exit")
     args = parser.parse_args()
 
@@ -536,21 +458,6 @@ def main() -> None:
             args.port = config.port
             args.baudrate = config.baudrate
 
-    # If --send-text is used we simply write the TEXT packet to the given port and exit
-    if args.send_text is not None:
-        if not args.port:
-            print("--send-text requires --port to be specified (the tty path to write into).")
-            return
-        payload = f"TEXT,{args.send_text}\n"
-        try:
-            # write raw bytes to the device path
-            with open(args.port, "wb", buffering=0) as f:
-                f.write(payload.encode("utf-8"))
-            print(f"Wrote TEXT packet to {args.port}")
-        except Exception as exc:
-            print(f"Failed to write to {args.port}: {exc}")
-        return
-
     monitor = SerialMonitor(port=args.port, baudrate=args.baudrate)
     enable_text_input = False
     # initial display kinds (interactive prompt if running interactively)
@@ -558,7 +465,6 @@ def main() -> None:
         kinds, enable_text_input = ask_display_kinds_interactive()
         monitor.set_display_kinds(kinds)
 
-    input_thread = None
     try:
         while True:
             try:
@@ -573,28 +479,7 @@ def main() -> None:
                     print(f"\n[serial] Press Ctrl+C to change options")
                 # Run the monitor in the background when text input is enabled so the main
                 # terminal can reliably accept typed TEXT packets.
-                if sys.stdin.isatty() and enable_text_input:
-                    if input_thread is None:
-                        monitor_thread = threading.Thread(target=monitor.start, daemon=True)
-                        monitor_thread.start()
-                        input_thread = monitor_thread
-                    print(colorize("Type text below and press Enter to send TEXT packets to the backend.", Ansi.DIM))
-                    while True:
-                        if not monitor_thread.is_alive() and not monitor.running:
-                            print(colorize("[monitor] reader loop stopped.", Ansi.RED))
-                            break
-                        try:
-                            line = input(colorize("[tx TEXT] > ", Ansi.BLUE)).strip()
-                        except EOFError:
-                            break
-                        except KeyboardInterrupt:
-                            raise
-                        if line:
-                            print(colorize(f"[input] {line}", Ansi.BLUE))
-                            monitor.send_text_packet(line)
-                    monitor.close()
-                else:
-                    monitor.start()
+                monitor.start()
                 # normal exit from monitor (not Ctrl+C)
                 break
             except KeyboardInterrupt:
