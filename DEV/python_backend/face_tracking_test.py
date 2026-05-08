@@ -77,6 +77,7 @@ import subprocess
 import requests
 import shutil
 
+_pyttsx3_engine = None
 
 @dataclass
 class CameraInfo:
@@ -95,7 +96,6 @@ class CameraSelection:
     log_display_kinds: Optional[List[str]] = None
     mic_device: Optional[str] = None
     mic_continuous: bool = False
-    initial_llm_text: Optional[str] = None
 
 
 RESOLUTION_PRESETS: List[Tuple[str, Tuple[int, int]]] = [
@@ -108,7 +108,7 @@ RESOLUTION_PRESETS: List[Tuple[str, Tuple[int, int]]] = [
 LOG_DISPLAY_PRESETS: List[Tuple[str, Optional[List[str]]]] = [
     ("All", None),
     ("Tracking", ["POS", "STAT"]),
-    ("LLM/Audio", ["TEXT", "ANIM", "AUDIO", "LLM", "STT", "TTS"]),
+    ("LLM/Audio", ["ANIM", "LLM", "STT", "TTS"]),
     ("Custom", []),
 ]
 
@@ -336,7 +336,15 @@ def tts_synthesize_to_wav(text: str) -> Optional[bytes]:
             log_line("TTS", f"[TTS] espeak failed: {exc}")
     try:
         import pyttsx3
-        engine = pyttsx3.init()
+        global _pyttsx3_engine
+        try:
+            engine = _pyttsx3_engine  # type: ignore
+        except NameError:
+            _pyttsx3_engine = None
+            engine = None
+        if engine is None:
+            _pyttsx3_engine = pyttsx3.init()
+            engine = _pyttsx3_engine
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             wav_path = f.name
         engine.save_to_file(text, wav_path)
@@ -358,61 +366,17 @@ def tts_synthesize_to_wav(text: str) -> Optional[bytes]:
     return None
 
 
-def parse_mic_label(label: Optional[str]) -> Tuple[Optional[str], Optional[Any]]:
+def parse_mic_label(label: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     if not label or label == "None":
         return None, None
-    if label == "Default (auto)":
-        return "auto", None
-    if label.startswith("pa:"):
-        match = re.match(r"pa:(\d+)", label)
-        if match:
-            return "pyaudio", int(match.group(1))
     if label.startswith("alsa:"):
         return "arecord", label.split(":", 1)[1]
+    if label.startswith("ALSA "):
+        return "arecord", label.replace("ALSA ", "", 1)
     return None, None
 
 
-def record_audio_chunk(backend: str, index: Optional[Any], duration: float = 4.0, sr: int = 16000) -> Optional[bytes]:
-    if backend == "auto":
-        backend = "pyaudio"
-        index = None
-
-    if backend == "pyaudio":
-        try:
-            import pyaudio
-            import wave
-            p = pyaudio.PyAudio()
-            FORMAT = pyaudio.paInt16
-            CHANNELS = 1
-            RATE = sr
-            CHUNK = 1024
-            frames: List[bytes] = []
-            stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, input_device_index=index, frames_per_buffer=CHUNK)
-            for _ in range(int(RATE / CHUNK * duration)):
-                data = stream.read(CHUNK, exception_on_overflow=False)
-                frames.append(data)
-            stream.stop_stream()
-            stream.close()
-            try:
-                p.terminate()
-            except Exception:
-                pass
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                wf = wave.open(f, "wb")
-                wf.setnchannels(CHANNELS)
-                wf.setsampwidth(p.get_sample_size(FORMAT))
-                wf.setframerate(RATE)
-                wf.writeframes(b"".join(frames))
-                wf.close()
-                path = f.name
-            data = Path(path).read_bytes()
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
-            return data
-        except Exception:
-            return None
+def record_audio_chunk(backend: str, index: Optional[str], duration: float = 4.0, sr: int = 16000) -> Optional[bytes]:
     if backend == "arecord":
         try:
             exe = shutil.which("arecord")
@@ -431,7 +395,7 @@ def record_audio_chunk(backend: str, index: Optional[Any], duration: float = 4.0
                 "-d",
                 str(int(duration)),
             ]
-            if isinstance(index, str) and index:
+            if index:
                 base_cmd.extend(["-D", index])
 
             # Try mono first, then stereo if the device rejects mono.
@@ -521,12 +485,28 @@ def start_chat_window(serial_port: Optional[str], serial_baudrate: int) -> None:
     scroll.pack(side="right", fill="y")
     text_widget.pack(side="left", fill="both", expand=True)
 
+    input_frame = tk.Frame(root)
+    input_frame.pack(fill="x", padx=8, pady=(0, 8))
+    input_text = tk.Text(input_frame, height=3, width=60)
+    input_text.pack(fill="x", expand=True)
+
     def send_llm_text_now() -> None:
-        txt = text_widget.get("1.0", "end").strip()
+        txt = input_text.get("1.0", "end").strip()
         if not txt:
-            messagebox.showinfo("Empty", "Enter a message first")
             return
-        threading.Thread(target=lambda: handle_incoming_text(txt, serial_ctrl), daemon=True).start()
+        text_widget.insert("end", f"You: {txt}\n\n")
+        text_widget.see("end")
+        text_widget.update()
+        input_text.delete("1.0", "end")
+        threading.Thread(target=lambda: handle_incoming_text(txt, serial_ctrl, text_widget), daemon=True).start()
+
+    def _on_enter_key(event: tk.Event) -> str:
+        if event.keysym == "Return" and not (event.state & 0x0001):
+            send_llm_text_now()
+            return "break"
+        return ""
+
+    input_text.bind("<Return>", _on_enter_key)
 
     btn_frame = tk.Frame(root)
     btn_frame.pack(fill="x", padx=8, pady=(0, 8))
@@ -539,7 +519,7 @@ def start_chat_window(serial_port: Optional[str], serial_baudrate: int) -> None:
             serial_ctrl.disconnect()
 
 
-def handle_incoming_text(user_text: str, serial_ctrl: Optional[SerialController] = None) -> None:
+def handle_incoming_text(user_text: str, serial_ctrl: Optional[SerialController] = None, text_widget=None) -> None:
     system_prompt = (
         "You are an assistant that MUST respond with a single, valid JSON object and NOTHING else.\n"
         "The JSON object MUST have exactly two fields: \n"
@@ -552,15 +532,24 @@ def handle_incoming_text(user_text: str, serial_ctrl: Optional[SerialController]
     llm_text = call_openrouter(system_prompt, user_text)
     if not llm_text:
         log_line("LLM", "[LLM] no response")
+        if text_widget:
+            text_widget.insert("end", "LLM: (no response)\n\n")
+            text_widget.see("end")
         return
     parsed = parse_llm_response_as_json(llm_text)
     if not parsed:
         log_line("LLM", f"[LLM] unexpected response format:\n{llm_text}")
+        if text_widget:
+            text_widget.insert("end", f"LLM: (parsing error)\n\n")
+            text_widget.see("end")
         return
     animation = parsed.get("animation", "speech")
     reply_text = parsed.get("text", "")
     log_line("LLM", f"[LLM] animation={animation} reply={reply_text}")
     log_line("ANIM", f"[ANIM] {animation}")
+    if text_widget:
+        text_widget.insert("end", f"LLM [{animation}]: {reply_text}\n\n")
+        text_widget.see("end")
     if serial_ctrl:
         serial_ctrl.send_animation(animation, reply_text)
     wav = tts_synthesize_to_wav(reply_text)
@@ -667,6 +656,20 @@ def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]
 
     frame.bind("<Configure>", _on_frame_configure)
 
+    def _on_mousewheel(event: tk.Event) -> None:
+        delta = event.delta
+        if delta == 0 and hasattr(event, "num"):
+            if event.num == 4:
+                delta = 120
+            elif event.num == 5:
+                delta = -120
+        if delta:
+            canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+
+    root.bind_all("<MouseWheel>", _on_mousewheel)
+    root.bind_all("<Button-4>", _on_mousewheel)
+    root.bind_all("<Button-5>", _on_mousewheel)
+
     tk.Label(frame, text="Face Tracking Setup", font=("DejaVu Sans", 11, "bold")).pack(anchor="w")
     tk.Label(frame, text="Configure camera and audio settings.").pack(anchor="w", pady=(4, 8))
 
@@ -733,6 +736,9 @@ def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]
 
     mic_cont_var = tk.BooleanVar(value=True)
     tk.Checkbutton(mic_frame, text="Record continuously (background)", variable=mic_cont_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8,0))
+
+    def _sync_chat_visibility() -> None:
+        pass
 
     def _refresh_mic_devices() -> None:
         nonlocal mic_device_entries
@@ -865,11 +871,6 @@ def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]
     idx = selected_index["value"]
     if idx is None or not (0 <= idx < len(cameras)):
         return None
-    try:
-        llm_text_value = llm_text_widget.get("1.0", "end").strip() or None
-    except Exception:
-        llm_text_value = None
-
     manual_alsa = mic_alsa_var.get().strip()
     if mic_var.get() == "None":
         mic_device_value = None
@@ -887,7 +888,6 @@ def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]
         log_display_kinds=selected_log_kinds["value"],
         mic_device=mic_device_value,
         mic_continuous=mic_cont_var.get(),
-        initial_llm_text=llm_text_value,
     )
 
 
@@ -1114,7 +1114,6 @@ def main() -> None:
         log_display_kinds = selected.log_display_kinds
         mic_device = selected.mic_device
         mic_continuous = selected.mic_continuous
-        initial_llm_text = selected.initial_llm_text
         serial_port = selected.serial_port
         serial_baudrate = selected.serial_baudrate
     else:
@@ -1124,7 +1123,6 @@ def main() -> None:
         log_display_kinds = None
         mic_device = None
         mic_continuous = False
-        initial_llm_text = None
         serial_port = args.serial_port
         serial_baudrate = args.serial_baudrate
 
