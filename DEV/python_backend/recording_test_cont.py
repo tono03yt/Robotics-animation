@@ -15,6 +15,7 @@ import threading
 import time
 import warnings
 from pathlib import Path
+from typing import Optional
 
 warnings.filterwarnings("ignore")
 
@@ -66,7 +67,7 @@ class LiveSpeechLoop:
         try:
             self.audio_queue.put_nowait(chunk.copy())
         except queue.Full:
-            # Drop newest chunk when overloaded to keep loop responsive.
+            # Drop oldest chunk behavior by skipping new data when overloaded.
             pass
 
     def _transcribe_chunk(self, chunk: np.ndarray) -> str:
@@ -84,7 +85,8 @@ class LiveSpeechLoop:
                 vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 400},
             )
-            return " ".join(seg.text.strip() for seg in segments).strip()
+            text = " ".join(seg.text.strip() for seg in segments).strip()
+            return text
         finally:
             try:
                 wav_path.unlink(missing_ok=True)
@@ -130,7 +132,7 @@ class LiveSpeechLoop:
                 self._speak(text)
 
     def run(self) -> None:
-        print("[Init] Models loaded.")
+        print("[Init] Loading models done.")
         print("[Run] Live sampling started. Press Ctrl+C to stop.")
 
         worker = threading.Thread(target=self._processor_loop, daemon=True)
