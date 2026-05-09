@@ -1,20 +1,13 @@
 #!/usr/bin/env python3
 """
-recording_test.py
-Live microphone sampling -> faster-whisper STT -> Kokoro TTS playback.
-Press Ctrl+C to stop.
+stt_tts.py — Record mic → faster-whisper (German) STT → Kokoro-82M TTS → play back.
+Press Ctrl+C to stop recording.
 """
 
-from __future__ import annotations
-
-import queue
-import signal
 import sys
-import tempfile
-import threading
 import time
 import warnings
-from pathlib import Path
+import tempfile
 
 warnings.filterwarnings("ignore")
 
@@ -23,148 +16,112 @@ try:
     import sounddevice as sd
     import soundfile as sf
     from faster_whisper import WhisperModel
-except ModuleNotFoundError as exc:
-    sys.exit(f"\nMissing dependency: {exc}\nInstall: pip install faster-whisper sounddevice soundfile numpy\n")
+except ModuleNotFoundError as e:
+    sys.exit(f"\n❌  Missing: {e}\n    pip install faster-whisper sounddevice soundfile numpy\n")
 
 try:
     from kokoro import KPipeline
 except ModuleNotFoundError:
-    sys.exit("\nKokoro not found. Install: pip install kokoro\n")
+    sys.exit("\n❌  Kokoro not found.\n    pip install kokoro && sudo apt install espeak-ng\n")
 
+# ── Config ──────────────────────────────────────────────────────────────────────
+SAMPLE_RATE    = 16_000
+CHANNELS       = 1
 
-# Audio and model config
-SAMPLE_RATE = 16000
-CHANNELS = 1
-BLOCKSIZE = 1600  # 100 ms
-WINDOW_SEC = 2.0
-HOP_SEC = 1.0
-MIN_RMS = 0.008
+# faster-whisper: use a German-fine-tuned model for best accuracy,
+# or fall back to "large-v3" which also handles German very well.
+# Options:
+#   "base"       → fast, decent German
+#   "large-v3"   → best multilingual accuracy (slower, ~1.5 GB)
+#   "TheChola/whisper-large-v3-turbo-german-faster-whisper" → German-optimised turbo
+WHISPER_MODEL  = "large-v3-turbo"
+COMPUTE_TYPE   = "int8"       # int8 = fast CPU; float16 needs GPU/ROCm
+DEVICE         = "cpu"        # change to "cuda" if ROCm is configured
 
-WHISPER_MODEL = "large-v3-turbo"
-COMPUTE_TYPE = "int8"
-DEVICE = "cpu"
+KOKORO_VOICE   = "af_sarah"   # af_bella | am_adam | am_michael | bf_emma | bm_george
+KOKORO_LANG    = "a"          # 'a' = American English, 'b' = British English
 
-KOKORO_VOICE = "af_sarah"
-KOKORO_LANG = "a"
-KOKORO_RATE = 24000
+# ── Terminal colours ────────────────────────────────────────────────────────────
+BOLD   = "\033[1m"; GREEN  = "\033[32m"; CYAN   = "\033[36m"
+YELLOW = "\033[33m"; DIM   = "\033[2m";  RESET  = "\033[0m"
 
+# ── Record mic ──────────────────────────────────────────────────────────────────
+def record(wav_path: str) -> None:
+    print(f"\n{BOLD}🎙  Aufnahme läuft…{RESET} {DIM}Strg+C zum Beenden.{RESET}\n")
+    chunks = []
 
-class LiveSpeechLoop:
-    def __init__(self) -> None:
-        self.stop_event = threading.Event()
-        self.audio_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=64)
-        self.playback_lock = threading.Lock()
-        self.whisper = WhisperModel(WHISPER_MODEL, device=DEVICE, compute_type=COMPUTE_TYPE)
-        self.kokoro = KPipeline(lang_code=KOKORO_LANG)
-
-    def _callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
-        if status:
-            print(f"[Audio] input status: {status}")
-        if self.stop_event.is_set():
-            return
-        chunk = indata[:, 0].astype(np.float32) if indata.ndim == 2 else indata.astype(np.float32)
-        try:
-            self.audio_queue.put_nowait(chunk.copy())
-        except queue.Full:
-            # Drop newest chunk when overloaded to keep loop responsive.
-            pass
-
-    def _transcribe_chunk(self, chunk: np.ndarray) -> str:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            wav_path = Path(tmp.name)
-        try:
-            sf.write(str(wav_path), chunk, SAMPLE_RATE)
-            segments, _ = self.whisper.transcribe(
-                str(wav_path),
-                language="de",
-                beam_size=5,
-                best_of=5,
-                temperature=0.0,
-                condition_on_previous_text=False,
-                vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 400},
-            )
-            return " ".join(seg.text.strip() for seg in segments).strip()
-        finally:
-            try:
-                wav_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-    def _speak(self, text: str) -> None:
-        with self.playback_lock:
-            audio_chunks = []
-            for _, _, audio in self.kokoro(text, voice=KOKORO_VOICE, speed=1.0):
-                audio_chunks.append(audio)
-            if not audio_chunks:
-                return
-            audio = np.concatenate(audio_chunks)
-            sd.play(audio, samplerate=KOKORO_RATE)
-            sd.wait()
-
-    def _processor_loop(self) -> None:
-        window_samples = int(WINDOW_SEC * SAMPLE_RATE)
-        hop_samples = int(HOP_SEC * SAMPLE_RATE)
-        buffer = np.zeros(0, dtype=np.float32)
-
-        while not self.stop_event.is_set():
-            try:
-                chunk = self.audio_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-
-            buffer = np.concatenate([buffer, chunk])
-            while buffer.size >= window_samples:
-                window = buffer[:window_samples]
-                buffer = buffer[hop_samples:] if hop_samples < buffer.size else np.zeros(0, dtype=np.float32)
-
-                rms = float(np.sqrt(np.mean(window * window))) if window.size else 0.0
-                if rms < MIN_RMS:
-                    continue
-
-                text = self._transcribe_chunk(window)
-                if not text:
-                    continue
-
-                print(f"[STT] {text}")
-                self._speak(text)
-
-    def run(self) -> None:
-        print("[Init] Models loaded.")
-        print("[Run] Live sampling started. Press Ctrl+C to stop.")
-
-        worker = threading.Thread(target=self._processor_loop, daemon=True)
-        worker.start()
-
-        with sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="float32",
-            blocksize=BLOCKSIZE,
-            callback=self._callback,
-        ):
-            while not self.stop_event.is_set():
-                time.sleep(0.1)
-
-    def stop(self) -> None:
-        self.stop_event.set()
-
-
-def main() -> None:
-    loop = LiveSpeechLoop()
-
-    def _handle_sigint(signum, frame) -> None:
-        loop.stop()
-
-    signal.signal(signal.SIGINT, _handle_sigint)
+    def callback(indata, frames, time_info, status):
+        chunks.append(indata.copy())
 
     try:
-        loop.run()
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS,
+                            dtype="int16", callback=callback):
+            while True:
+                time.sleep(0.1)
     except KeyboardInterrupt:
-        loop.stop()
-    finally:
-        print("[Exit] Stopped live sampling.")
+        pass
 
+    audio = np.concatenate(chunks, axis=0)
+    sf.write(wav_path, audio, SAMPLE_RATE)
+    print(f"\n{DIM}✅ Aufgenommen: {len(audio) / SAMPLE_RATE:.1f}s{RESET}")
 
+# ── faster-whisper STT (German) ─────────────────────────────────────────────────
+def transcribe(wav_path: str) -> str:
+    print(f"{DIM}⏳ Lade faster-whisper ({WHISPER_MODEL}) auf {DEVICE}…{RESET}")
+    model = WhisperModel(WHISPER_MODEL, device=DEVICE, compute_type=COMPUTE_TYPE)
+
+    print(f"{DIM}🔍 Transkribiere (Deutsch)…{RESET}")
+    segments, info = model.transcribe(
+        wav_path,
+        language="de",                        # force German
+        beam_size=5,
+        best_of=5,
+        temperature=0.0,                       # deterministic output
+        condition_on_previous_text=False,
+        vad_filter=True,                       # skip silence chunks
+        vad_parameters=dict(
+            min_silence_duration_ms=500
+        ),
+    )
+
+    text = " ".join(seg.text.strip() for seg in segments)
+    print(f"{DIM}🌐 Erkannte Sprache: {info.language} "
+          f"(Konfidenz: {info.language_probability:.0%}){RESET}")
+    return text.strip()
+
+# ── Kokoro TTS ──────────────────────────────────────────────────────────────────
+def speak(text: str) -> None:
+    print(f"{DIM}🔊 Kokoro synthetisiert ({KOKORO_VOICE})…{RESET}")
+    pipeline     = KPipeline(lang_code=KOKORO_LANG)
+    audio_chunks = []
+
+    for _, _, audio in pipeline(text, voice=KOKORO_VOICE, speed=1.0):
+        audio_chunks.append(audio)
+
+    if not audio_chunks:
+        print(f"{DIM}⚠  Kein Audio generiert.{RESET}")
+        return
+
+    sd.play(np.concatenate(audio_chunks), samplerate=24_000)
+    sd.wait()
+
+# ── Print transcript word-by-word ───────────────────────────────────────────────
+def print_transcript(text: str) -> None:
+    print(f"\n{BOLD}{GREEN}📝 Transkript:{RESET}\n")
+    for word in text.split():
+        sys.stdout.write(f"{CYAN}{word}{RESET} ")
+        sys.stdout.flush()
+        time.sleep(0.04)
+    print("\n")
+
+# ── Main ─────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    main()
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        wav_path = tmp.name
+
+    record(wav_path)
+    text = transcribe(wav_path)
+    print_transcript(text)
+
+    print(f"{BOLD}{YELLOW}🗣  Spreche…{RESET}")
+    speak(text)
