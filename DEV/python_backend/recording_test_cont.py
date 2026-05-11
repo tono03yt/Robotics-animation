@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-recording_test_cont.py — Continuous Lossless STT Pipeline.
-Uses Queues and Voice Activity Detection (VAD) to segment full sentences.
-GUI updates continuously while background threads handle processing without dropping frames.
+recording_test_cont.py — Continuous Lossless STT Pipeline with Smart Auto Gain.
+Uses Queues, VAD, and 3-Stage AGC (Attack, Speech-Leveling, Silence-Decay).
 """
 
 from __future__ import annotations
@@ -27,6 +26,11 @@ except ModuleNotFoundError as exc:
     sys.exit(f"\nMissing dependency: {exc}\nInstall: pip install faster-whisper sounddevice soundfile numpy\n")
 
 try:
+    from kokoro import KPipeline
+except (ModuleNotFoundError, ImportError):
+    sys.exit("\nKokoro not found or KPipeline could not be imported. Install/reinstall: pip install --upgrade kokoro\n")
+
+try:
     import tkinter as tk
     from tkinter import ttk
 except ImportError:
@@ -38,219 +42,200 @@ SAMPLE_RATE = 16000
 CHANNELS = 2
 BLOCKSIZE = 1600  # 100 ms chunks
 MIN_RMS = 0.010   # Volume threshold to trigger speech
-PRE_ROLL_CHUNKS = 5   # Keep 0.5s of audio before speech starts to catch consonants
-POST_ROLL_CHUNKS = 10 # Wait 1.0s of silence before finalizing the sentence
+PRE_ROLL_CHUNKS = 5   # Keep 0.5s of audio before speech starts
+POST_ROLL_CHUNKS = 10 # Wait 1.0s of silence before finalizing sentence
 
-WHISPER_MODEL = "large-v3-turbo"
+WHISPER_MODEL_WAKEWORD = "tiny.en"
+WHISPER_MODEL_TRANSCRIPTION = "large-v3-turbo"
 COMPUTE_TYPE = "int8"
 DEVICE = "cpu"
-LANGUAGE = "de"  # Set your target language here
+LANGUAGE = "de"  
+KOKORO_LANG = "de"
+KOKORO_RATE = 24000
+
+GAIN = 1.0  # Initial gain multiplier
+WAKEWORD = "computer"
 
 
-class LosslessSpeechApp:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("Lossless STT Pipeline")
-        self.root.geometry("400x250")
+class VolumeMonitorGUI:
+    def __init__(self, root_window=None):
+        self.root = root_window or tk.Tk()
+        self.root.title("Recording Monitor - Live STT/TTS")
+        self.root.geometry("400x300")
         self.root.resizable(False, False)
-
-        # Thread-safe GUI states
-        self.is_running = True
-        self.gain_value = tk.DoubleVar(value=1.0)
+        
+        self.gain_value = tk.DoubleVar(value=GAIN)
         self.rms_value = tk.DoubleVar(value=0.0)
         self.status_text = tk.StringVar(value="Initializing models...")
         self.internal_status = "Initializing models..." 
 
-        self._build_ui()
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-        # Queues for lossless pipeline
-        self.raw_audio_queue = queue.Queue()      # Holds 100ms chunks directly from mic
-        self.utterance_queue = queue.Queue()      # Holds completed full sentences (numpy arrays)
-        
+        # Internal state for the audio thread
+        self.internal_gain = 1.0
         self.last_rms = 0.0
 
-        # Start Background Threads
-        threading.Thread(target=self._init_system, daemon=True).start()
-        threading.Thread(target=self._vad_worker, daemon=True).start()
-        threading.Thread(target=self._stt_worker, daemon=True).start()
-
-        # Start standard Tkinter UI update loop
-        self.root.after(100, self._update_gui_loop)
-
+        self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+    
     def _build_ui(self):
         """Build the GUI layout."""
-        title = tk.Label(self.root, text="🎤 Continuous STT", font=("Arial", 14, "bold"))
-        title.pack(pady=10)
-
+        # Title
+        title_frame = tk.Frame(self.root)
+        title_frame.pack(pady=5)
+        self.wakeword_indicator = tk.Label(title_frame, text="●", font=("Arial", 20), fg="grey")
+        self.wakeword_indicator.pack(side="left", padx=5)
+        title = tk.Label(title_frame, text="🎤 Recording Monitor", font=("Arial", 14, "bold"))
+        title.pack(side="left")
+        
         # Volume Display
-        vol_frame = tk.LabelFrame(self.root, text="Input Level (RMS)", padx=10, pady=10)
+        vol_frame = tk.LabelFrame(self.root, text="Input Level (RMS)", padx=10, pady=5)
         vol_frame.pack(fill="x", padx=10, pady=5)
         
         self.vol_bar = ttk.Progressbar(vol_frame, variable=self.rms_value, maximum=0.1, mode="determinate")
-        self.vol_bar.pack(fill="x", pady=5)
+        self.vol_bar.pack(fill="x", pady=2)
         
         self.vol_label = tk.Label(vol_frame, text="0.000", font=("Courier", 11, "bold"))
         self.vol_label.pack()
-
+        
         # Gain Control
-        gain_frame = tk.LabelFrame(self.root, text="Gain Multiplier", padx=10, pady=10)
+        gain_frame = tk.LabelFrame(self.root, text="Gain Multiplier", padx=10, pady=5)
         gain_frame.pack(fill="x", padx=10, pady=5)
         
         self.gain_slider = ttk.Scale(
-            gain_frame, from_=0.1, to=5.0, variable=self.gain_value, orient="horizontal"
+            gain_frame, 
+            from_=0.1, 
+            to=5.0, 
+            variable=self.gain_value, 
+            orient="horizontal"
         )
-        self.gain_slider.pack(fill="x", pady=5)
-
+        self.gain_slider.pack(fill="x", pady=2)
+        
+        self.gain_label = tk.Label(gain_frame, text="1.0x", font=("Courier", 11, "bold"))
+        self.gain_label.pack()
+        
         # Status
-        status_frame = tk.LabelFrame(self.root, text="Pipeline Status", padx=10, pady=10)
+        status_frame = tk.LabelFrame(self.root, text="Status", padx=10, pady=5)
         status_frame.pack(fill="x", padx=10, pady=5)
         
         self.status_label = tk.Label(status_frame, textvariable=self.status_text, font=("Arial", 10), wraplength=350)
         self.status_label.pack()
+        
+        # Control Buttons
+        btn_frame = tk.Frame(self.root)
+        btn_frame.pack(fill="x", padx=10, pady=5)
+        
+        self.stop_btn = tk.Button(btn_frame, text="Stop Recording", bg="#ff6b6b", fg="white", command=self._on_close)
+        self.stop_btn.pack(fill="x", pady=2)
+    
+    def update_volume(self, rms: float):
+        """Update volume level (RMS) in the GUI."""
+        self.rms_value.set(min(rms, 0.1))
+        
+        # Color bar green when speaking, black when silent
+        if rms >= MIN_RMS:
+            self.vol_label.config(text=f"{rms:.4f}", fg="green")
+        else:
+            self.vol_label.config(text=f"{rms:.4f}", fg="black")
 
-    def _init_system(self):
-        """Background initialization of models and audio stream."""
-        print("[Init] Loading Whisper model...", end=" ", flush=True)
+    def update_status(self, text: str):
+        """Update status message."""
+        self.status_text.set(text)
+        
+    def set_wakeword_state(self, state: str):
+        """Change color of wakeword indicator. States: 'waiting', 'listening', 'processing'."""
+        colors = {"waiting": "grey", "listening": "green", "processing": "orange"}
+        self.wakeword_indicator.config(fg=colors.get(state, "grey"))
+    
+    def get_gain(self) -> float:
+        """Retrieve the current gain multiplier value."""
+        return self.gain_value.get()
+
+    def process_events(self):
+        """Process pending GUI events (MUST be called from main thread only)."""
         try:
-            self.whisper = WhisperModel(WHISPER_MODEL, device=DEVICE, compute_type=COMPUTE_TYPE)
+            self.root.update()
+            return True
+        except tk.TclError:
+            return False
+
+    def _on_close(self):
+        """Cleanup logic when application window is closed."""
+        self.root.destroy()
+        print("\n[Exit] Application closed.")
+        sys.exit(0)
+
+
+class LiveSpeechLoop:
+    def __init__(self, gui: VolumeMonitorGUI = None) -> None:
+        self.gui = gui
+        self.stop_event = threading.Event()
+        self.audio_lock = threading.Lock()
+        self.audio_buffer = np.zeros(0, dtype=np.float32)
+        self.total_samples = 0
+        self.last_processed_total_samples = 0
+        self.speaking_event = threading.Event()
+        self.playback_lock = threading.Lock()
+        self.last_rms = 0.0
+        self.is_listening_for_command = False
+        self.command_listen_start_time = 0
+        
+        print("[Init] Loading Wakeword model...", end=" ", flush=True)
+        try:
+            self.whisper_wakeword = WhisperModel(WHISPER_MODEL_WAKEWORD, device=DEVICE, compute_type=COMPUTE_TYPE)
             print("✓")
         except Exception as e:
-            print(f"✗\n[Error] Failed to load Whisper: {e}")
-            self.internal_status = "Error loading Whisper!"
-            return
+            print(f"✗\n[Error] Failed to load Wakeword model: {e}")
+            raise
 
-        self.internal_status = "Listening for speech..."
-        print("\n[Run] Pipeline started. Speak into the microphone. Output will appear here.\n")
-
-        # Start Audio Stream
+        print("[Init] Loading Transcription model...", end=" ", flush=True)
         try:
-            self.stream = sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype="float32",
-                blocksize=BLOCKSIZE,
-                callback=self._audio_callback,
-            )
-            self.stream.start()
+            self.whisper_transcription = WhisperModel(WHISPER_MODEL_TRANSCRIPTION, device=DEVICE, compute_type=COMPUTE_TYPE)
+            print("✓")
         except Exception as e:
-            print(f"[Stream Error] {e}")
-            self.internal_status = f"Mic Error: {e}"
-
-    def _audio_callback(self, indata: np.ndarray, frames: int, time_info, status):
-        """Instantaneous audio callback. Drops data immediately into the raw queue."""
-        if not self.is_running:
-            return
-
+            print(f"✗\n[Error] Failed to load Transcription model: {e}")
+            raise
+        
+        print("[Init] Loading Kokoro TTS...", end=" ", flush=True)
         try:
-            # Extract first channel, apply gain
+            self.kokoro = KPipeline(lang_code="a") # Force English for TTS
+            print("✓")
+        except Exception as e:
+            print(f"✗\n[Error] Failed to load Kokoro: {e}")
+            raise
+
+    def _callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
+        """Audio stream callback for processing incoming audio data."""
+        try:
+            # Extract first channel
             chunk = indata[:, 0].astype(np.float32) if indata.ndim == 2 else indata.astype(np.float32)
-            chunk = chunk * self.gain_value.get()
-            
-            # Fast RMS calculation
-            rms = float(np.sqrt(np.mean(chunk * chunk))) if chunk.size else 0.0
-            self.last_rms = rms
 
-            # Immediately queue data, blocking nothing
-            self.raw_queue_put(chunk, rms)
+            with self.audio_lock:
+                # Append new audio data to buffer
+                self.audio_buffer = np.concatenate((self.audio_buffer, chunk))
+
+            # --- HARD CLIPPER ---
+            chunk = np.clip(chunk, -0.99, 0.99)
+
+            # Calculate and display RMS
+            self.last_rms = float(np.sqrt(np.mean(chunk * chunk))) if chunk.size else 0.0
         except Exception as e:
-            print(f"\n[Audio Callback Error] {e}")
+            print(f"[Audio Callback Error] {e}")
 
-    def raw_queue_put(self, chunk, rms):
-        # Prevent infinite memory if processing crashes
-        if self.raw_audio_queue.qsize() < 1000:  
-            self.raw_audio_queue.put((chunk, rms))
-
-    def _vad_worker(self):
-        """
-        Voice Activity Detection Thread.
-        Reads 100ms chunks, detects speech boundaries, and packages full sentences.
-        """
-        pre_roll_buffer = collections.deque(maxlen=PRE_ROLL_CHUNKS)
-        is_speaking = False
-        silence_counter = 0
-        current_utterance = []
-
-        while self.is_running:
-            try:
-                # Get next chunk
-                chunk, rms = self.raw_audio_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-
-            if not is_speaking:
-                if rms >= MIN_RMS:
-                    # Speech started!
-                    is_speaking = True
-                    self.internal_status = "🟢 Recording Sentence..."
-                    
-                    # Attach the pre-roll (last 0.5 seconds) so we don't chop the first consonant
-                    current_utterance = list(pre_roll_buffer)
-                    current_utterance.append(chunk)
-                    silence_counter = 0
-                else:
-                    # Maintain rolling window of silence
-                    pre_roll_buffer.append(chunk)
-            else:
-                # Currently recording a sentence
-                current_utterance.append(chunk)
-                
-                if rms < MIN_RMS:
-                    silence_counter += 1
-                    if silence_counter >= POST_ROLL_CHUNKS:
-                        # 1.0 second of silence detected. Sentence complete!
-                        is_speaking = False
-                        self.internal_status = "⚙️ Queuing Sentence..."
-                        
-                        full_audio = np.concatenate(current_utterance)
-                        self.utterance_queue.put(full_audio)
-                        
-                        current_utterance = []
-                        pre_roll_buffer.clear()
-                else:
-                    # Still speaking, reset silence counter
-                    silence_counter = 0
-
-    def _stt_worker(self):
-        """
-        Transcription Thread.
-        Pops completed sentences off the queue and transcribes them safely in the background.
-        """
-        while self.is_running:
-            try:
-                # Wait for a fully recorded sentence
-                audio_data = self.utterance_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-
-            # If multiple sentences stack up in the queue, let the user know
-            q_size = self.utterance_queue.qsize()
-            backlog_text = f" (+{q_size} in queue)" if q_size > 0 else ""
-            self.internal_status = f"📝 Transcribing{backlog_text}..."
-
-            text = self._transcribe(audio_data)
-
-            if text:
-                print(f"[STT] {text}")
-                self.internal_status = "Listening for speech..."
-            else:
-                self.internal_status = "Listening for speech..."
-
-    def _transcribe(self, audio_array: np.ndarray) -> str:
-        """Helper to invoke faster-whisper over an audio array."""
+    def _transcribe(self, chunk: np.ndarray, model: WhisperModel, language="en") -> str:
+        """Transcribe audio chunk using the specified Whisper model."""
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             wav_path = Path(tmp.name)
-            
         try:
-            sf.write(str(wav_path), audio_array, SAMPLE_RATE)
-            segments, _ = self.whisper.transcribe(
+            sf.write(str(wav_path), chunk, SAMPLE_RATE)
+            segments, _ = model.transcribe(
                 str(wav_path),
-                language=LANGUAGE,
+                language=language,
                 beam_size=1,
                 temperature=0.0,
                 condition_on_previous_text=False,
+                vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 300},
             )
-            return " ".join(seg.text.strip() for seg in segments).strip()
+            return " ".join(seg.text.strip() for seg in segments).strip().lower()
         except Exception as e:
             print(f"[STT Error] {e}")
             return ""
@@ -260,46 +245,117 @@ class LosslessSpeechApp:
             except Exception:
                 pass
 
-    def _update_gui_loop(self):
-        """Main thread loop to sync state into the GUI safely."""
-        if not self.is_running:
-            return
-
-        # Synchronize UI values with class state
-        rms = self.last_rms
-        self.rms_value.set(min(rms, 0.1))
-        
-        # Color bar green when speaking, blue when silent
-        if rms >= MIN_RMS:
-            self.vol_label.config(text=f"{rms:.4f}", fg="green")
-        else:
-            self.vol_label.config(text=f"{rms:.4f}", fg="black")
-
-        self.status_text.set(self.internal_status)
-
-        # Reschedule update
-        self.root.after(50, self._update_gui_loop)
-
-    def _on_close(self):
-        """Cleanup logic when application window is closed."""
-        self.is_running = False
-        self.internal_status = "Shutting down..."
-        
+    def _speak(self, text: str) -> None:
+        """Convert text to speech using Kokoro TTS."""
         try:
-            if hasattr(self, 'stream'):
-                self.stream.stop()
-                self.stream.close()
-        except Exception:
-            pass
+            with self.playback_lock:
+                self.kokoro.play(text, sample_rate=KOKORO_RATE)
+        except Exception as e:
+            print(f"[TTS Error] {e}")
 
-        self.root.destroy()
-        print("\n[Exit] Application closed.")
-        sys.exit(0)
+    def _processor_loop(self) -> None:
+        """Main processing loop for wakeword detection and command transcription."""
+        wakeword_window_samples = int(1.5 * SAMPLE_RATE)
+        command_listen_duration = 4.0  # seconds
+
+        while not self.stop_event.is_set():
+            try:
+                time.sleep(0.2) # Faster loop for wakeword
+                
+                if self.speaking_event.is_set():
+                    self.gui.internal_status = "Speaking (TTS)..."
+                    continue
+
+                with self.audio_lock:
+                    buffer = self.audio_buffer.copy()
+
+                if not self.is_listening_for_command:
+                    if self.gui:
+                        self.gui.internal_status = f"Waiting for '{WAKEWORD}'..."
+
+                    if buffer.size < wakeword_window_samples:
+                        continue
+                    
+                    window = buffer[-wakeword_window_samples:]
+                    text = self._transcribe(window, self.whisper_wakeword)
+
+                    if WAKEWORD in text:
+                        print(f"[WakeWord] Detected '{WAKEWORD}'")
+                        self.is_listening_for_command = True
+                        self.command_listen_start_time = time.time()
+                        if self.gui:
+                            self.gui.internal_status = "Listening for command..."
+                        # Clear buffer to only get command
+                        with self.audio_lock:
+                            self.audio_buffer = np.zeros(0, dtype=np.float32)
+
+                else: # We are listening for a command
+                    elapsed = time.time() - self.command_listen_start_time
+                    if self.gui:
+                        self.gui.internal_status = f"Listening... {command_listen_duration - elapsed:.1f}s left"
+
+                    if elapsed > command_listen_duration:
+                        if self.gui:
+                            self.gui.internal_status = "Transcribing command..."
+
+                        command_audio = buffer.copy()
+                        text = self._transcribe(command_audio, self.whisper_transcription, language="de")
+                        
+                        self.is_listening_for_command = False # Reset state
+                        with self.audio_lock:
+                            self.audio_buffer = np.zeros(0, dtype=np.float32)
+
+                        if not text:
+                            print("[STT] No command recognized.")
+                            continue
+
+                        print(f"[STT] {text}")
+                        
+                        if self.gui:
+                            self.gui.internal_status = f"Replying: {text[:50]}..."
+                        
+                        self._speak(text)
+
+            except Exception as e:
+                print(f"[Processor Error] {e}")
+                if self.gui:
+                    self.gui.internal_status = f"Error: {str(e)[:50]}"
+                    self.is_listening_for_command = False # Reset on error
 
 
 def main():
     root = tk.Tk()
-    app = LosslessSpeechApp(root)
+    app = VolumeMonitorGUI(root)
+    speech_loop = LiveSpeechLoop(app)
+
+    def _gui_updater():
+        """This function runs in the main thread to safely update the GUI."""
+        if not app.process_events(): # Checks if window was closed
+            speech_loop.stop_event.set()
+            return
+
+        # Update status text
+        app.update_status(app.internal_status)
+
+        # Update wakeword indicator
+        if "Waiting" in app.internal_status:
+            app.set_wakeword_state("waiting")
+        elif "Listening" in app.internal_status:
+            app.set_wakeword_state("listening")
+        elif "Transcribing" in app.internal_status or "Replying" in app.internal_status:
+            app.set_wakeword_state("processing")
+
+        # Update volume and gain
+        app.update_volume(speech_loop.last_rms)
+        app.internal_gain = app.get_gain() # Safely get gain from slider
+
+        root.after(100, _gui_updater) # Schedule next update
+
+    # Start the processor loop in a separate thread
+    threading.Thread(target=speech_loop._processor_loop, daemon=True).start()
+    
+    # Start the GUI updater loop
+    root.after(100, _gui_updater)
     root.mainloop()
 
 
