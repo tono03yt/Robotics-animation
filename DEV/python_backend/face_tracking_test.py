@@ -323,13 +323,13 @@ def transcribe_audio_bytes(audio_bytes: bytes) -> Optional[str]:
             pass
 
 
-def tts_synthesize_to_wav(text: str) -> Optional[bytes]:
+def tts_synthesize_to_wav(text: str, language: str = "de") -> Optional[bytes]:
     espeak = shutil.which("espeak")
     if espeak:
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 wav_path = f.name
-            subprocess.run([espeak, "-w", wav_path, text], check=True)
+            subprocess.run([espeak, "-v", language, "-w", wav_path, text], check=True)
             data = Path(wav_path).read_bytes()
             try:
                 os.unlink(wav_path)
@@ -349,6 +349,28 @@ def tts_synthesize_to_wav(text: str) -> Optional[bytes]:
         if engine is None:
             _pyttsx3_engine = pyttsx3.init()
             engine = _pyttsx3_engine
+        
+        # Set German language/voice for pyttsx3
+        try:
+            # Try to get available voices and select German one
+            voices = engine.getProperty('voices')
+            german_voice = None
+            for voice in voices:
+                if hasattr(voice, 'languages') and 'de' in voice.languages:
+                    german_voice = voice
+                    break
+                # Fallback: check language in name
+                if 'de' in str(voice.name).lower() or 'german' in str(voice.name).lower():
+                    german_voice = voice
+                    break
+            if german_voice:
+                engine.setProperty('voice', german_voice.id)
+            else:
+                # If no German voice found, try to set by language code
+                engine.setProperty('language', 'de')
+        except Exception:
+            pass
+        
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             wav_path = f.name
         engine.save_to_file(text, wav_path)

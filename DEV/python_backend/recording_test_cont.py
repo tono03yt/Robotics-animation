@@ -61,7 +61,7 @@ class VolumeMonitorGUI:
     def __init__(self, root_window=None):
         self.root = root_window or tk.Tk()
         self.root.title("Recording Monitor - Live STT/TTS")
-        self.root.geometry("400x300")
+        self.root.geometry("400x440")
         self.root.resizable(False, False)
         
         self.gain_value = tk.DoubleVar(value=GAIN)
@@ -119,6 +119,26 @@ class VolumeMonitorGUI:
         self.status_label = tk.Label(status_frame, textvariable=self.status_text, font=("Arial", 10), wraplength=350)
         self.status_label.pack()
         
+        # Toggle Options
+        toggle_frame = tk.LabelFrame(self.root, text="Mode", padx=10, pady=5)
+        toggle_frame.pack(fill="x", padx=10, pady=5)
+        
+        self.wakeword_mode_var = tk.BooleanVar(value=True)
+        self.wakeword_mode_check = tk.Checkbutton(
+            toggle_frame, 
+            text="Wakeword Detection ('computer')", 
+            variable=self.wakeword_mode_var
+        )
+        self.wakeword_mode_check.pack(anchor="w", pady=2)
+        
+        self.tts_output_var = tk.BooleanVar(value=True)
+        self.tts_output_check = tk.Checkbutton(
+            toggle_frame,
+            text="Enable TTS Output",
+            variable=self.tts_output_var,
+        )
+        self.tts_output_check.pack(anchor="w", pady=2)
+        
         # Control Buttons
         btn_frame = tk.Frame(self.root)
         btn_frame.pack(fill="x", padx=10, pady=5)
@@ -148,6 +168,14 @@ class VolumeMonitorGUI:
     def get_gain(self) -> float:
         """Retrieve the current gain multiplier value."""
         return self.gain_value.get()
+    
+    def is_wakeword_mode_enabled(self) -> bool:
+        """Check if wakeword mode is enabled."""
+        return self.wakeword_mode_var.get()
+
+    def is_tts_output_enabled(self) -> bool:
+        """Check if TTS output is enabled."""
+        return self.tts_output_var.get()
 
     def process_events(self):
         """Process pending GUI events (MUST be called from main thread only)."""
@@ -202,9 +230,26 @@ class LiveSpeechLoop:
             print(f"✗\n[Error] Failed to load Kokoro: {e}")
             raise
 
+    def start(self):
+        """Starts the audio stream and processing loop."""
+        self.stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            blocksize=BLOCKSIZE,
+            channels=CHANNELS,
+            callback=self._callback,
+            dtype="float32",
+        )
+        self.stream.start()
+        print("\n[Info] Audio stream started.")
+        threading.Thread(target=self._processor_loop, daemon=True).start()
+
     def _callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
         """Audio stream callback for processing incoming audio data."""
         try:
+            # Apply gain
+            gain = self.gui.internal_gain if self.gui else 1.0
+            indata *= gain
+
             # Extract first channel
             chunk = indata[:, 0].astype(np.float32) if indata.ndim == 2 else indata.astype(np.float32)
 
@@ -247,20 +292,37 @@ class LiveSpeechLoop:
 
     def _speak(self, text: str) -> None:
         """Convert text to speech using Kokoro TTS."""
+        if self.gui and not self.gui.is_tts_output_enabled():
+            return
         try:
             with self.playback_lock:
-                self.kokoro.play(text, sample_rate=KOKORO_RATE)
+                self.speaking_event.set()
+                try:
+                    if hasattr(self.kokoro, "tts"):
+                        result = self.kokoro.tts(text)
+                        if isinstance(result, tuple) and len(result) == 2:
+                            audio, sr = result
+                        else:
+                            audio, sr = result, KOKORO_RATE
+                        sd.play(audio, sr)
+                        sd.wait()
+                    else:
+                        raise AttributeError("KPipeline does not expose tts()")
+                finally:
+                    self.speaking_event.clear()
         except Exception as e:
+            self.speaking_event.clear()
             print(f"[TTS Error] {e}")
 
     def _processor_loop(self) -> None:
         """Main processing loop for wakeword detection and command transcription."""
         wakeword_window_samples = int(1.5 * SAMPLE_RATE)
         command_listen_duration = 4.0  # seconds
+        continuous_buffer_samples = int(3.0 * SAMPLE_RATE) # Process 3-second chunks in continuous mode
 
         while not self.stop_event.is_set():
             try:
-                time.sleep(0.2) # Faster loop for wakeword
+                time.sleep(0.1) # Loop faster for responsiveness
                 
                 if self.speaking_event.is_set():
                     self.gui.internal_status = "Speaking (TTS)..."
@@ -269,52 +331,83 @@ class LiveSpeechLoop:
                 with self.audio_lock:
                     buffer = self.audio_buffer.copy()
 
-                if not self.is_listening_for_command:
-                    if self.gui:
-                        self.gui.internal_status = f"Waiting for '{WAKEWORD}'..."
+                wakeword_mode = self.gui.is_wakeword_mode_enabled() if self.gui else True
 
-                    if buffer.size < wakeword_window_samples:
+                if wakeword_mode:
+                    # --- Wakeword Detection Mode ---
+                    if not self.is_listening_for_command:
+                        if self.gui:
+                            self.gui.internal_status = f"Waiting for '{WAKEWORD}'..."
+
+                        if buffer.size < wakeword_window_samples:
+                            continue
+                        
+                        window = buffer[-wakeword_window_samples:]
+                        text = self._transcribe(window, self.whisper_wakeword)
+
+                        if WAKEWORD in text:
+                            print(f"[WakeWord] Detected '{WAKEWORD}'")
+                            self.is_listening_for_command = True
+                            self.command_listen_start_time = time.time()
+                            if self.gui:
+                                self.gui.internal_status = "Listening for command..."
+                            # Clear buffer to only get command
+                            with self.audio_lock:
+                                self.audio_buffer = np.zeros(0, dtype=np.float32)
+
+                    else: # We are listening for a command
+                        elapsed = time.time() - self.command_listen_start_time
+                        if self.gui:
+                            self.gui.internal_status = f"Listening... {command_listen_duration - elapsed:.1f}s left"
+
+                        if elapsed > command_listen_duration:
+                            if self.gui:
+                                self.gui.internal_status = "Transcribing command..."
+                            
+                            command_audio = buffer.copy()
+                            text = self._transcribe(command_audio, self.whisper_transcription, language="de")
+                            
+                            self.is_listening_for_command = False # Reset state
+                            with self.audio_lock:
+                                self.audio_buffer = np.zeros(0, dtype=np.float32)
+
+                            if not text:
+                                print("[STT] No command recognized.")
+                                continue
+
+                            print(f"[STT] {text}")
+                            
+                            if self.gui:
+                                self.gui.internal_status = f"Replying: {text[:50]}..."
+                            
+                            self._speak(text)
+                
+                else:
+                    # --- Continuous Sampling Mode ---
+                    if self.gui:
+                        self.gui.internal_status = "Continuous Mode - transcribing..."
+                    
+                    if buffer.size < continuous_buffer_samples:
                         continue
                     
-                    window = buffer[-wakeword_window_samples:]
-                    text = self._transcribe(window, self.whisper_wakeword)
+                    # Process the oldest chunk of audio
+                    chunk_to_process = buffer[:continuous_buffer_samples]
+                    
+                    # Trim the buffer
+                    with self.audio_lock:
+                        self.audio_buffer = self.audio_buffer[continuous_buffer_samples:]
 
-                    if WAKEWORD in text:
-                        print(f"[WakeWord] Detected '{WAKEWORD}'")
-                        self.is_listening_for_command = True
-                        self.command_listen_start_time = time.time()
-                        if self.gui:
-                            self.gui.internal_status = "Listening for command..."
-                        # Clear buffer to only get command
-                        with self.audio_lock:
-                            self.audio_buffer = np.zeros(0, dtype=np.float32)
+                    text = self._transcribe(chunk_to_process, self.whisper_transcription, language="de")
 
-                else: # We are listening for a command
-                    elapsed = time.time() - self.command_listen_start_time
+                    if not text:
+                        continue
+
+                    print(f"[STT] {text}")
+                    
                     if self.gui:
-                        self.gui.internal_status = f"Listening... {command_listen_duration - elapsed:.1f}s left"
-
-                    if elapsed > command_listen_duration:
-                        if self.gui:
-                            self.gui.internal_status = "Transcribing command..."
-
-                        command_audio = buffer.copy()
-                        text = self._transcribe(command_audio, self.whisper_transcription, language="de")
-                        
-                        self.is_listening_for_command = False # Reset state
-                        with self.audio_lock:
-                            self.audio_buffer = np.zeros(0, dtype=np.float32)
-
-                        if not text:
-                            print("[STT] No command recognized.")
-                            continue
-
-                        print(f"[STT] {text}")
-                        
-                        if self.gui:
-                            self.gui.internal_status = f"Replying: {text[:50]}..."
-                        
-                        self._speak(text)
+                        self.gui.internal_status = f"Replying: {text[:50]}..."
+                    
+                    self._speak(text)
 
             except Exception as e:
                 print(f"[Processor Error] {e}")
@@ -348,11 +441,12 @@ def main():
         # Update volume and gain
         app.update_volume(speech_loop.last_rms)
         app.internal_gain = app.get_gain() # Safely get gain from slider
+        app.gain_label.config(text=f"{app.internal_gain:.1f}x")
 
         root.after(100, _gui_updater) # Schedule next update
 
-    # Start the processor loop in a separate thread
-    threading.Thread(target=speech_loop._processor_loop, daemon=True).start()
+    # Start the audio stream and processor loop
+    speech_loop.start()
     
     # Start the GUI updater loop
     root.after(100, _gui_updater)
