@@ -1,29 +1,41 @@
 #!/usr/bin/env python3
 """
-recording_test_cont.py — Continuous Lossless STT Pipeline with Smart Auto Gain.
-Uses Queues, VAD, and 3-Stage AGC (Attack, Speech-Leveling, Silence-Decay).
+recording_test_cont.py — Continuous Lossless STT Pipeline with Wakeword + VAD.
 """
 
 from __future__ import annotations
 
 import collections
+import os
 import queue
 import sys
-import tempfile
+import signal
 import threading
 import time
 import warnings
-from pathlib import Path
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+os.environ.setdefault("ORT_DISABLE_CUDA", "1")
 
 warnings.filterwarnings("ignore")
 
 try:
     import numpy as np
     import sounddevice as sd
-    import soundfile as sf
     from faster_whisper import WhisperModel
 except ModuleNotFoundError as exc:
-    sys.exit(f"\nMissing dependency: {exc}\nInstall: pip install faster-whisper sounddevice soundfile numpy\n")
+    sys.exit(f"\nMissing dependency: {exc}\nInstall: pip install faster-whisper sounddevice numpy\n")
+
+try:
+    import webrtcvad
+except ModuleNotFoundError as exc:
+    sys.exit(f"\nMissing dependency: {exc}\nInstall: pip install webrtcvad\n")
+
+try:
+    import openwakeword
+    from openwakeword.model import Model as WakewordModel
+except ModuleNotFoundError as exc:
+    sys.exit(f"\nMissing dependency: {exc}\nInstall: pip install openwakeword\n")
 
 try:
     from kokoro import KPipeline
@@ -39,13 +51,27 @@ except ImportError:
 
 # Audio and model config
 SAMPLE_RATE = 16000
-CHANNELS = 2
+CHANNELS = 1
 BLOCKSIZE = 1600  # 100 ms chunks
 MIN_RMS = 0.010   # Volume threshold to trigger speech
 PRE_ROLL_CHUNKS = 5   # Keep 0.5s of audio before speech starts
 POST_ROLL_CHUNKS = 10 # Wait 1.0s of silence before finalizing sentence
 
-WHISPER_MODEL_WAKEWORD = "tiny.en"
+WAKEWORD_MODEL_NAME = "hey_jarvis"
+WAKEWORD_MODEL_PATH = ""  # Optional: full path to a custom openwakeword model
+WAKEWORD_DISPLAY = "hey jarvis"
+WAKEWORD_THRESHOLD = 0.5
+WAKEWORD_DEBOUNCE_FRAMES = 3
+WAKEWORD_FRAME_MS = 80
+WAKEWORD_FRAME_SAMPLES = int(SAMPLE_RATE * WAKEWORD_FRAME_MS / 1000)
+
+VAD_AGGRESSIVENESS = 2
+VAD_FRAME_MS = 30
+VAD_FRAME_SAMPLES = int(SAMPLE_RATE * VAD_FRAME_MS / 1000)
+VAD_SPEECH_FRAMES_REQUIRED = 2
+
+RING_BUFFER_SECONDS = 15
+
 WHISPER_MODEL_TRANSCRIPTION = "large-v3-turbo"
 COMPUTE_TYPE = "int8"
 DEVICE = "cpu"
@@ -53,24 +79,18 @@ LANGUAGE = "de"
 KOKORO_LANG = "de"
 KOKORO_RATE = 24000
 
-GAIN = 1.0  # Initial gain multiplier
-WAKEWORD = "computer"
-
-
 class VolumeMonitorGUI:
-    def __init__(self, root_window=None):
+    def __init__(self, root_window=None, on_close=None):
         self.root = root_window or tk.Tk()
         self.root.title("Recording Monitor - Live STT/TTS")
         self.root.geometry("400x440")
         self.root.resizable(False, False)
-        
-        self.gain_value = tk.DoubleVar(value=GAIN)
+
         self.rms_value = tk.DoubleVar(value=0.0)
         self.status_text = tk.StringVar(value="Initializing models...")
         self.internal_status = "Initializing models..." 
+        self.on_close = on_close
 
-        # Internal state for the audio thread
-        self.internal_gain = 1.0
         self.last_rms = 0.0
 
         self._build_ui()
@@ -96,22 +116,6 @@ class VolumeMonitorGUI:
         self.vol_label = tk.Label(vol_frame, text="0.000", font=("Courier", 11, "bold"))
         self.vol_label.pack()
         
-        # Gain Control
-        gain_frame = tk.LabelFrame(self.root, text="Gain Multiplier", padx=10, pady=5)
-        gain_frame.pack(fill="x", padx=10, pady=5)
-        
-        self.gain_slider = ttk.Scale(
-            gain_frame, 
-            from_=0.1, 
-            to=5.0, 
-            variable=self.gain_value, 
-            orient="horizontal"
-        )
-        self.gain_slider.pack(fill="x", pady=2)
-        
-        self.gain_label = tk.Label(gain_frame, text="1.0x", font=("Courier", 11, "bold"))
-        self.gain_label.pack()
-        
         # Status
         status_frame = tk.LabelFrame(self.root, text="Status", padx=10, pady=5)
         status_frame.pack(fill="x", padx=10, pady=5)
@@ -125,8 +129,8 @@ class VolumeMonitorGUI:
         
         self.wakeword_mode_var = tk.BooleanVar(value=True)
         self.wakeword_mode_check = tk.Checkbutton(
-            toggle_frame, 
-            text="Wakeword Detection ('computer')", 
+            toggle_frame,
+            text=f"Wakeword Detection ('{WAKEWORD_DISPLAY}')",
             variable=self.wakeword_mode_var
         )
         self.wakeword_mode_check.pack(anchor="w", pady=2)
@@ -165,10 +169,6 @@ class VolumeMonitorGUI:
         colors = {"waiting": "grey", "listening": "green", "processing": "orange"}
         self.wakeword_indicator.config(fg=colors.get(state, "grey"))
     
-    def get_gain(self) -> float:
-        """Retrieve the current gain multiplier value."""
-        return self.gain_value.get()
-    
     def is_wakeword_mode_enabled(self) -> bool:
         """Check if wakeword mode is enabled."""
         return self.wakeword_mode_var.get()
@@ -187,9 +187,10 @@ class VolumeMonitorGUI:
 
     def _on_close(self):
         """Cleanup logic when application window is closed."""
+        if callable(self.on_close):
+            self.on_close()
         self.root.destroy()
         print("\n[Exit] Application closed.")
-        sys.exit(0)
 
 
 class LiveSpeechLoop:
@@ -197,18 +198,37 @@ class LiveSpeechLoop:
         self.gui = gui
         self.stop_event = threading.Event()
         self.audio_lock = threading.Lock()
-        self.audio_buffer = np.zeros(0, dtype=np.float32)
-        self.total_samples = 0
-        self.last_processed_total_samples = 0
+        self.audio_buffer = RingBuffer(max_samples=RING_BUFFER_SECONDS * SAMPLE_RATE)
+        self.command_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=8)
         self.speaking_event = threading.Event()
         self.playback_lock = threading.Lock()
         self.last_rms = 0.0
         self.is_listening_for_command = False
-        self.command_listen_start_time = 0
+        self.command_audio_chunks: list[np.ndarray] = []
+        self.command_samples_needed = 0
+        self.wakeword_hits = 0
+        self.speech_frame_hits = 0
+        self.vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+        self.wakeword_model_name = WAKEWORD_MODEL_NAME
         
         print("[Init] Loading Wakeword model...", end=" ", flush=True)
         try:
-            self.whisper_wakeword = WhisperModel(WHISPER_MODEL_WAKEWORD, device=DEVICE, compute_type=COMPUTE_TYPE)
+            download_models = getattr(openwakeword.utils, "download_models", None)
+            if callable(download_models):
+                download_models()
+
+            if WAKEWORD_MODEL_PATH:
+                self.oww_model = WakewordModel(wakeword_model_paths=[WAKEWORD_MODEL_PATH])
+                self.wakeword_model_name = list(self.oww_model.models.keys())[0]
+            else:
+                if WAKEWORD_MODEL_NAME in openwakeword.models:
+                    model_path = openwakeword.models[WAKEWORD_MODEL_NAME]["model_path"]
+                    self.oww_model = WakewordModel(wakeword_model_paths=[model_path])
+                    self.wakeword_model_name = WAKEWORD_MODEL_NAME
+                else:
+                    self.oww_model = WakewordModel()
+                    self.wakeword_model_name = list(self.oww_model.models.keys())[0]
+
             print("✓")
         except Exception as e:
             print(f"✗\n[Error] Failed to load Wakeword model: {e}")
@@ -241,21 +261,31 @@ class LiveSpeechLoop:
         )
         self.stream.start()
         print("\n[Info] Audio stream started.")
-        threading.Thread(target=self._processor_loop, daemon=True).start()
+        threading.Thread(target=self._kws_loop, daemon=True).start()
+        threading.Thread(target=self._transcription_loop, daemon=True).start()
+
+    def stop(self) -> None:
+        """Stop audio processing and release the input stream."""
+        self.stop_event.set()
+        if hasattr(self, "stream"):
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
 
     def _callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
         """Audio stream callback for processing incoming audio data."""
         try:
-            # Apply gain
-            gain = self.gui.internal_gain if self.gui else 1.0
-            indata *= gain
+            if self.speaking_event.is_set():
+                self.last_rms = 0.0
+                return
 
             # Extract first channel
             chunk = indata[:, 0].astype(np.float32) if indata.ndim == 2 else indata.astype(np.float32)
 
             with self.audio_lock:
-                # Append new audio data to buffer
-                self.audio_buffer = np.concatenate((self.audio_buffer, chunk))
+                self.audio_buffer.push(chunk)
 
             # --- HARD CLIPPER ---
             chunk = np.clip(chunk, -0.99, 0.99)
@@ -267,12 +297,11 @@ class LiveSpeechLoop:
 
     def _transcribe(self, chunk: np.ndarray, model: WhisperModel, language="en") -> str:
         """Transcribe audio chunk using the specified Whisper model."""
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            wav_path = Path(tmp.name)
+        if chunk.size == 0:
+            return ""
         try:
-            sf.write(str(wav_path), chunk, SAMPLE_RATE)
             segments, _ = model.transcribe(
-                str(wav_path),
+                chunk,
                 language=language,
                 beam_size=1,
                 temperature=0.0,
@@ -284,11 +313,6 @@ class LiveSpeechLoop:
         except Exception as e:
             print(f"[STT Error] {e}")
             return ""
-        finally:
-            try:
-                wav_path.unlink(missing_ok=True)
-            except Exception:
-                pass
 
     def _speak(self, text: str) -> None:
         """Convert text to speech using Kokoro TTS."""
@@ -300,126 +324,211 @@ class LiveSpeechLoop:
                 try:
                     if hasattr(self.kokoro, "tts"):
                         result = self.kokoro.tts(text)
-                        if isinstance(result, tuple) and len(result) == 2:
-                            audio, sr = result
-                        else:
-                            audio, sr = result, KOKORO_RATE
-                        sd.play(audio, sr)
-                        sd.wait()
+                    elif callable(self.kokoro):
+                        result = self.kokoro(text)
                     else:
                         raise AttributeError("KPipeline does not expose tts()")
+
+                    if isinstance(result, tuple) and len(result) == 2:
+                        audio, sr = result
+                    else:
+                        audio, sr = result, KOKORO_RATE
+
+                    sd.play(audio, sr)
+                    sd.wait()
                 finally:
                     self.speaking_event.clear()
         except Exception as e:
             self.speaking_event.clear()
             print(f"[TTS Error] {e}")
 
-    def _processor_loop(self) -> None:
-        """Main processing loop for wakeword detection and command transcription."""
-        wakeword_window_samples = int(1.5 * SAMPLE_RATE)
+    def _kws_loop(self) -> None:
+        """Wakeword detection loop with VAD gating and debouncing."""
         command_listen_duration = 4.0  # seconds
-        continuous_buffer_samples = int(3.0 * SAMPLE_RATE) # Process 3-second chunks in continuous mode
+        command_samples = int(command_listen_duration * SAMPLE_RATE)
+        continuous_buffer_samples = int(3.0 * SAMPLE_RATE)
+        leftover = np.zeros(0, dtype=np.float32)
 
         while not self.stop_event.is_set():
             try:
-                time.sleep(0.1) # Loop faster for responsiveness
-                
+                time.sleep(0.01)
                 if self.speaking_event.is_set():
-                    self.gui.internal_status = "Speaking (TTS)..."
+                    if self.gui:
+                        self.gui.internal_status = "Speaking (TTS)..."
                     continue
-
-                with self.audio_lock:
-                    buffer = self.audio_buffer.copy()
 
                 wakeword_mode = self.gui.is_wakeword_mode_enabled() if self.gui else True
 
-                if wakeword_mode:
-                    # --- Wakeword Detection Mode ---
-                    if not self.is_listening_for_command:
-                        if self.gui:
-                            self.gui.internal_status = f"Waiting for '{WAKEWORD}'..."
+                with self.audio_lock:
+                    chunk = self.audio_buffer.pop(WAKEWORD_FRAME_SAMPLES)
 
-                        if buffer.size < wakeword_window_samples:
-                            continue
-                        
-                        window = buffer[-wakeword_window_samples:]
-                        text = self._transcribe(window, self.whisper_wakeword)
+                if chunk is None:
+                    continue
 
-                        if WAKEWORD in text:
-                            print(f"[WakeWord] Detected '{WAKEWORD}'")
-                            self.is_listening_for_command = True
-                            self.command_listen_start_time = time.time()
-                            if self.gui:
-                                self.gui.internal_status = "Listening for command..."
-                            # Clear buffer to only get command
-                            with self.audio_lock:
-                                self.audio_buffer = np.zeros(0, dtype=np.float32)
-
-                    else: # We are listening for a command
-                        elapsed = time.time() - self.command_listen_start_time
-                        if self.gui:
-                            self.gui.internal_status = f"Listening... {command_listen_duration - elapsed:.1f}s left"
-
-                        if elapsed > command_listen_duration:
-                            if self.gui:
-                                self.gui.internal_status = "Transcribing command..."
-                            
-                            command_audio = buffer.copy()
-                            text = self._transcribe(command_audio, self.whisper_transcription, language="de")
-                            
-                            self.is_listening_for_command = False # Reset state
-                            with self.audio_lock:
-                                self.audio_buffer = np.zeros(0, dtype=np.float32)
-
-                            if not text:
-                                print("[STT] No command recognized.")
-                                continue
-
-                            print(f"[STT] {text}")
-                            
-                            if self.gui:
-                                self.gui.internal_status = f"Replying: {text[:50]}..."
-                            
-                            self._speak(text)
-                
-                else:
-                    # --- Continuous Sampling Mode ---
+                if not wakeword_mode:
                     if self.gui:
                         self.gui.internal_status = "Continuous Mode - transcribing..."
-                    
-                    if buffer.size < continuous_buffer_samples:
-                        continue
-                    
-                    # Process the oldest chunk of audio
-                    chunk_to_process = buffer[:continuous_buffer_samples]
-                    
-                    # Trim the buffer
-                    with self.audio_lock:
-                        self.audio_buffer = self.audio_buffer[continuous_buffer_samples:]
+                    if leftover.size:
+                        chunk = np.concatenate((leftover, chunk))
+                        leftover = np.zeros(0, dtype=np.float32)
 
-                    text = self._transcribe(chunk_to_process, self.whisper_transcription, language="de")
-
-                    if not text:
+                    if chunk.size < continuous_buffer_samples:
+                        leftover = chunk
                         continue
 
-                    print(f"[STT] {text}")
-                    
+                    chunk_to_process = chunk[:continuous_buffer_samples]
+                    leftover = chunk[continuous_buffer_samples:]
+                    try:
+                        self.command_queue.put_nowait(chunk_to_process)
+                    except queue.Full:
+                        pass
+                    continue
+
+                # Wakeword mode
+                if self.gui and not self.is_listening_for_command:
+                    self.gui.internal_status = f"Waiting for '{WAKEWORD_DISPLAY}'..."
+
+                audio_int16 = np.clip(chunk, -1.0, 1.0)
+                audio_int16 = (audio_int16 * 32767.0).astype(np.int16)
+
+                if not self._is_speech(audio_int16):
+                    self.speech_frame_hits = 0
+                    if not self.is_listening_for_command:
+                        self.wakeword_hits = 0
+                    continue
+
+                self.speech_frame_hits += 1
+                if self.speech_frame_hits < VAD_SPEECH_FRAMES_REQUIRED:
+                    continue
+
+                if self.is_listening_for_command:
+                    self.command_audio_chunks.append(chunk)
+                    self.command_samples_needed -= chunk.size
+                    if self.command_samples_needed <= 0:
+                        command_audio = np.concatenate(self.command_audio_chunks).astype(np.float32, copy=False)
+                        self.command_audio_chunks = []
+                        self.is_listening_for_command = False
+                        if self.gui:
+                            self.gui.internal_status = "Transcribing command..."
+                        try:
+                            self.command_queue.put_nowait(command_audio[:command_samples])
+                        except queue.Full:
+                            pass
+                    continue
+
+                prediction = self.oww_model.predict(audio_int16)
+                score = float(prediction.get(self.wakeword_model_name, 0.0))
+
+                if score >= WAKEWORD_THRESHOLD:
+                    self.wakeword_hits += 1
+                else:
+                    self.wakeword_hits = 0
+
+                if self.wakeword_hits >= WAKEWORD_DEBOUNCE_FRAMES:
+                    print(f"[WakeWord] Detected '{WAKEWORD_DISPLAY}'")
+                    self.is_listening_for_command = True
+                    self.command_samples_needed = command_samples
+                    self.command_audio_chunks = []
+                    self.wakeword_hits = 0
                     if self.gui:
-                        self.gui.internal_status = f"Replying: {text[:50]}..."
-                    
-                    self._speak(text)
+                        self.gui.internal_status = "Listening for command..."
 
             except Exception as e:
-                print(f"[Processor Error] {e}")
+                print(f"[KWS Error] {e}")
                 if self.gui:
                     self.gui.internal_status = f"Error: {str(e)[:50]}"
-                    self.is_listening_for_command = False # Reset on error
+                self.is_listening_for_command = False
+                self.command_audio_chunks = []
+                self.command_samples_needed = 0
+
+    def _transcription_loop(self) -> None:
+        """Transcription loop decoupled from KWS and audio capture."""
+        while not self.stop_event.is_set():
+            try:
+                chunk = self.command_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            text = self._transcribe(chunk, self.whisper_transcription, language="de")
+            if not text:
+                continue
+
+            print(f"[STT] {text}")
+            if self.gui:
+                self.gui.internal_status = f"Replying: {text[:50]}..."
+            self._speak(text)
+
+    def _is_speech(self, audio_int16: np.ndarray) -> bool:
+        """Return True if VAD detects speech in the provided audio frame."""
+        if audio_int16.size < VAD_FRAME_SAMPLES:
+            return False
+
+        frame_bytes = audio_int16.tobytes()
+        frame_length_bytes = VAD_FRAME_SAMPLES * 2
+        for i in range(0, len(frame_bytes) - frame_length_bytes + 1, frame_length_bytes):
+            if self.vad.is_speech(frame_bytes[i:i + frame_length_bytes], SAMPLE_RATE):
+                return True
+        return False
+
+
+class RingBuffer:
+    def __init__(self, max_samples: int) -> None:
+        self.max_samples = max_samples
+        self.buffers: collections.deque[np.ndarray] = collections.deque()
+        self.size = 0
+
+    def push(self, samples: np.ndarray) -> None:
+        if samples.size == 0:
+            return
+
+        self.buffers.append(samples)
+        self.size += samples.size
+
+        while self.size > self.max_samples and self.buffers:
+            oldest = self.buffers.popleft()
+            self.size -= oldest.size
+
+    def pop(self, n_samples: int) -> np.ndarray | None:
+        if self.size < n_samples:
+            return None
+
+        chunks: list[np.ndarray] = []
+        remaining = n_samples
+        while remaining > 0 and self.buffers:
+            head = self.buffers[0]
+            if head.size <= remaining:
+                chunks.append(self.buffers.popleft())
+                self.size -= head.size
+                remaining -= head.size
+            else:
+                chunks.append(head[:remaining])
+                self.buffers[0] = head[remaining:]
+                self.size -= remaining
+                remaining = 0
+
+        if not chunks:
+            return None
+
+        return np.concatenate(chunks).astype(np.float32, copy=False)
 
 
 def main():
     root = tk.Tk()
-    app = VolumeMonitorGUI(root)
-    speech_loop = LiveSpeechLoop(app)
+    speech_loop = LiveSpeechLoop(None)
+
+    def _shutdown():
+        speech_loop.stop()
+
+    def _handle_sigint(_signal, _frame):
+        _shutdown()
+        try:
+            root.quit()
+        except tk.TclError:
+            pass
+
+    signal.signal(signal.SIGINT, _handle_sigint)
+    app = VolumeMonitorGUI(root, on_close=_shutdown)
+    speech_loop.gui = app
 
     def _gui_updater():
         """This function runs in the main thread to safely update the GUI."""
@@ -438,10 +547,8 @@ def main():
         elif "Transcribing" in app.internal_status or "Replying" in app.internal_status:
             app.set_wakeword_state("processing")
 
-        # Update volume and gain
+        # Update volume
         app.update_volume(speech_loop.last_rms)
-        app.internal_gain = app.get_gain() # Safely get gain from slider
-        app.gain_label.config(text=f"{app.internal_gain:.1f}x")
 
         root.after(100, _gui_updater) # Schedule next update
 
@@ -451,6 +558,7 @@ def main():
     # Start the GUI updater loop
     root.after(100, _gui_updater)
     root.mainloop()
+    _shutdown()
 
 
 if __name__ == "__main__":
