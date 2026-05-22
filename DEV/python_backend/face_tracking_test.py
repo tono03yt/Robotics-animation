@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Real-time face tracking with local STT -> LLM -> TTS on the PC.
+"""Real-time face tracking with LLM chat on the PC.
 
 The backend detects the largest face and reports tracking plus animation
-type in the terminal (e.g. waving, speech). Microphone input and audio
-output are handled locally on the PC.
+type in the terminal (e.g. waving, speech). Text input is handled via a
+local chat window.
 """
 
 from __future__ import annotations
@@ -72,16 +72,7 @@ _bootstrap_project_venv()
 import cv2
 import threading
 import json
-import tempfile
-import subprocess
 import requests
-import shutil
-import io
-import wave
-import array
-import struct
-
-_pyttsx3_engine = None
 
 @dataclass
 class CameraInfo:
@@ -98,8 +89,6 @@ class CameraSelection:
     serial_port: Optional[str] = None
     serial_baudrate: int = 115200
     log_display_kinds: Optional[List[str]] = None
-    mic_device: Optional[str] = None
-    mic_continuous: bool = False
 
 
 RESOLUTION_PRESETS: List[Tuple[str, Tuple[int, int]]] = [
@@ -112,7 +101,7 @@ RESOLUTION_PRESETS: List[Tuple[str, Tuple[int, int]]] = [
 LOG_DISPLAY_PRESETS: List[Tuple[str, Optional[List[str]]]] = [
     ("All", None),
     ("Tracking", ["POS", "STAT"]),
-    ("LLM/Audio", ["ANIM", "LLM", "STT", "TTS"]),
+    ("LLM", ["ANIM", "LLM"]),
     ("Custom", []),
 ]
 
@@ -157,10 +146,8 @@ def log_line(kind: str, message: str, *, always: bool = False) -> None:
             print(colorize(message, Ansi.CYAN), flush=True)
         elif tag in {"LLM", "ANIM"}:
             print(colorize(message, Ansi.MAGENTA), flush=True)
-        elif tag in {"AUDIO", "TTS"}:
+        elif tag == "AUDIO":
             print(colorize(message, Ansi.GREEN), flush=True)
-        elif tag == "STT":
-            print(colorize(message, Ansi.YELLOW), flush=True)
         else:
             print(colorize(message, Ansi.DIM), flush=True)
 
@@ -236,7 +223,7 @@ class SerialController:
             self.connected = False
 
 
-# --- LLM / STT / TTS helpers ---
+# --- LLM helpers ---
 def _read_api_key(path: str = "api_key_openrouterai") -> Optional[str]:
     try:
         p = Path(__file__).resolve().parent / path
@@ -297,222 +284,6 @@ def parse_llm_response_as_json(text: str) -> Optional[dict]:
         return {"animation": anim, "text": txt}
     except Exception:
         return None
-
-
-def transcribe_audio_bytes(audio_bytes: bytes) -> Optional[str]:
-    try:
-        import whisper
-    except Exception:
-        return None
-    tmp = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            f.write(audio_bytes)
-            tmp = f.name
-        model = whisper.load_model("small")
-        res = model.transcribe(tmp)
-        return res.get("text")
-    except Exception as exc:
-        log_line("STT", f"[STT] transcribe failed: {exc}")
-        return None
-    finally:
-        try:
-            if tmp:
-                os.unlink(tmp)
-        except Exception:
-            pass
-
-
-def tts_synthesize_to_wav(text: str, language: str = "de") -> Optional[bytes]:
-    espeak = shutil.which("espeak")
-    if espeak:
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                wav_path = f.name
-            subprocess.run([espeak, "-v", language, "-w", wav_path, text], check=True)
-            data = Path(wav_path).read_bytes()
-            try:
-                os.unlink(wav_path)
-            except Exception:
-                pass
-            return data
-        except Exception as exc:
-            log_line("TTS", f"[TTS] espeak failed: {exc}")
-    try:
-        import pyttsx3
-        global _pyttsx3_engine
-        try:
-            engine = _pyttsx3_engine  # type: ignore
-        except NameError:
-            _pyttsx3_engine = None
-            engine = None
-        if engine is None:
-            _pyttsx3_engine = pyttsx3.init()
-            engine = _pyttsx3_engine
-        
-        # Set German language/voice for pyttsx3
-        try:
-            # Try to get available voices and select German one
-            voices = engine.getProperty('voices')
-            german_voice = None
-            for voice in voices:
-                if hasattr(voice, 'languages') and 'de' in voice.languages:
-                    german_voice = voice
-                    break
-                # Fallback: check language in name
-                if 'de' in str(voice.name).lower() or 'german' in str(voice.name).lower():
-                    german_voice = voice
-                    break
-            if german_voice:
-                engine.setProperty('voice', german_voice.id)
-            else:
-                # If no German voice found, try to set by language code
-                engine.setProperty('language', 'de')
-        except Exception:
-            pass
-        
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            wav_path = f.name
-        engine.save_to_file(text, wav_path)
-        engine.runAndWait()
-        # pyttsx3 may return without producing a valid file on some Linux setups.
-        if not Path(wav_path).exists():
-            raise RuntimeError("pyttsx3 did not create output file")
-        data = Path(wav_path).read_bytes()
-        if len(data) < 44:
-            raise RuntimeError("pyttsx3 produced an empty/invalid WAV")
-        try:
-            os.unlink(wav_path)
-        except Exception:
-            pass
-        return data
-    except Exception as exc:
-        log_line("TTS", f"[TTS] pyttsx3 failed: {exc}")
-    log_line("TTS", "[TTS] No local TTS engine available (install espeak or pyttsx3)")
-    return None
-
-
-def parse_mic_label(label: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    if not label or label == "None":
-        return None, None
-    if label.startswith("alsa:"):
-        return "arecord", label.split(":", 1)[1]
-    if label.startswith("ALSA "):
-        return "arecord", label.replace("ALSA ", "", 1)
-    return None, None
-
-
-def scan_alsa_devices() -> List[Tuple[str, str]]:
-    """Scan for available ALSA recording devices. Returns list of (display_name, device_id)."""
-    devices = []
-    try:
-        exe = shutil.which("arecord")
-        if not exe:
-            return devices
-        result = subprocess.run([exe, "-l"], capture_output=True, text=True)
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if not line or line.startswith("*"):
-                continue
-            # Format: "card 0: PCH [Intel PCH]" or "  device 0: ALC269 Analog [ALC269 Analog]"
-            if "card" in line and ":" in line:
-                parts = line.split(":", 1)
-                if len(parts) == 2:
-                    card_num = parts[0].replace("card", "").strip()
-                    card_name = parts[1].strip()
-                    try:
-                        # Use plughw for device sharing (handles concurrent access via ALSA plugins)
-                        device_id = f"plughw:{card_num},0"
-                        # Format display name so parse_mic_label can extract device_id
-                        display_name = f"ALSA {device_id} - {card_name}"
-                        devices.append((display_name, device_id))
-                    except Exception:
-                        pass
-    except Exception as exc:
-        log_line("STT", f"[STT] arecord -l scan failed: {exc}")
-    return devices
-
-
-def record_audio_chunk(backend: str, index: Optional[str], duration: float = 4.0, sr: int = 16000) -> Optional[bytes]:
-    if backend == "arecord":
-        try:
-            exe = shutil.which("arecord")
-            if not exe:
-                return None
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                path = f.name
-
-            base_cmd = [
-                exe,
-                "-q",
-                "-f",
-                "S16_LE",
-                "-r",
-                str(sr),
-                "-d",
-                str(int(duration)),
-            ]
-            if index:
-                base_cmd.extend(["-D", index])
-
-            # Try stereo first (more compatible), then mono as fallback.
-            for channels in (2, 1):
-                cmd = base_cmd + ["-c", str(channels), path]
-                result = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=duration + 2)
-                if result.returncode == 0:
-                    data = Path(path).read_bytes()
-                    try:
-                        os.unlink(path)
-                    except Exception:
-                        pass
-                    return data
-                if result.stderr and channels == 2:
-                    log_line("STT", f"[STT] arecord -D {index} -c {channels}: {result.stderr.strip()[:100]}")
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
-            log_line("STT", f"[STT] arecord failed with device '{index}' (stereo and mono)")
-            return None
-        except Exception:
-            return None
-    return None
-
-
-def play_audio_bytes(audio_bytes: bytes) -> bool:
-    try:
-        import sounddevice as sd
-        import soundfile as sf
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            path = f.name
-            f.write(audio_bytes)
-        data, sr = sf.read(path, dtype="float32")
-        sd.play(data, sr)
-        sd.wait()
-        try:
-            os.unlink(path)
-        except Exception:
-            pass
-        return True
-    except Exception:
-        pass
-
-    for player in ("aplay", "paplay"):
-        exe = shutil.which(player)
-        if exe:
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                    path = f.name
-                    f.write(audio_bytes)
-                subprocess.run([exe, path], check=False)
-                try:
-                    os.unlink(path)
-                except Exception:
-                    pass
-                return True
-            except Exception:
-                pass
-    return False
 
 
 def start_chat_window(serial_port: Optional[str], serial_baudrate: int) -> None:
@@ -578,140 +349,6 @@ def start_chat_window(serial_port: Optional[str], serial_baudrate: int) -> None:
             serial_ctrl.disconnect()
 
 
-def _apply_gain_to_wav_bytes(wav_bytes: bytes, gain: float) -> Optional[bytes]:
-    try:
-        bio = io.BytesIO(wav_bytes)
-        with wave.open(bio, 'rb') as wf:
-            params = wf.getparams()
-            frames = wf.readframes(wf.getnframes())
-        # Expect 16-bit PCM
-        sample_width = params.sampwidth
-        if sample_width != 2:
-            return wav_bytes
-        samples = array.array('h')
-        samples.frombytes(frames)
-        # Apply gain with clipping
-        maxv = 2 ** 15 - 1
-        minv = -2 ** 15
-        for i in range(len(samples)):
-            v = int(samples[i] * gain)
-            if v > maxv:
-                v = maxv
-            elif v < minv:
-                v = minv
-            samples[i] = v
-        out = io.BytesIO()
-        with wave.open(out, 'wb') as wf:
-            wf.setparams(params)
-            wf.writeframes(samples.tobytes())
-        return out.getvalue()
-    except Exception:
-        return None
-
-
-def _compute_level_from_wav_bytes(wav_bytes: bytes) -> float:
-    try:
-        bio = io.BytesIO(wav_bytes)
-        with wave.open(bio, 'rb') as wf:
-            frames = wf.readframes(wf.getnframes())
-            sampwidth = wf.getsampwidth()
-        if sampwidth != 2:
-            return 0.0
-        samples = array.array('h')
-        samples.frombytes(frames)
-        if not samples:
-            return 0.0
-        # RMS
-        s = 0
-        for v in samples:
-            s += v * v
-        rms = (s / len(samples)) ** 0.5
-        return float(rms) / 32768.0
-    except Exception:
-        return 0.0
-
-
-def start_realtime_stt_window(mic_label: Optional[str] = None, parent=None):
-    try:
-        import tkinter as tk
-        from tkinter import ttk
-    except Exception as exc:
-        log_line("ERROR", f"[STT] Tkinter not available: {exc}", always=True)
-        return
-
-    backend, index = parse_mic_label(mic_label)
-
-    window = tk.Toplevel(parent) if parent is not None else tk.Tk()
-    window.title("Realtime STT")
-    window.geometry("520x320")
-    if parent is not None:
-        try:
-            window.transient(parent)
-        except Exception:
-            pass
-    frame = tk.Frame(window, padx=8, pady=8)
-    frame.pack(fill="both", expand=True)
-
-    text_widget = tk.Text(frame, height=12, width=60)
-    text_widget.pack(fill="both", expand=True)
-
-    meter_frame = tk.Frame(frame)
-    meter_frame.pack(fill="x", pady=(6, 0))
-    tk.Label(meter_frame, text="Input level:").pack(side="left")
-    level_var = tk.DoubleVar(value=0.0)
-    level_bar = ttk.Progressbar(meter_frame, orient="horizontal", mode="determinate", maximum=1.0, variable=level_var)
-    level_bar.pack(side="left", fill="x", expand=True, padx=(6, 0))
-
-    gain_frame = tk.Frame(frame)
-    gain_frame.pack(fill="x", pady=(6, 0))
-    tk.Label(gain_frame, text="Gain:").pack(side="left")
-    gain_var = tk.DoubleVar(value=1.0)
-    gain_scale = tk.Scale(gain_frame, variable=gain_var, from_=0.1, to=5.0, resolution=0.1, orient="horizontal", length=300)
-    gain_scale.pack(side="left", padx=(6, 0))
-
-    ctrl_frame = tk.Frame(frame)
-    ctrl_frame.pack(fill="x", pady=(8, 0))
-    start_stop_var = {"running": False}
-
-    def _stop():
-        start_stop_var["running"] = False
-
-    def _start():
-        if start_stop_var["running"]:
-            return
-        start_stop_var["running"] = True
-
-        def _loop():
-            while start_stop_var["running"]:
-                data = record_audio_chunk(backend or "arecord", index, duration=1.0)
-                if not data:
-                    time.sleep(0.1)
-                    continue
-                level = _compute_level_from_wav_bytes(data)
-                try:
-                    window.after(0, level_var.set, min(max(level, 0.0), 1.0))
-                except Exception:
-                    pass
-                gain = gain_var.get()
-                gained = _apply_gain_to_wav_bytes(data, gain) or data
-                # Transcribe in background
-                def _do_transcribe(chunk):
-                    txt = transcribe_audio_bytes(chunk)
-                    if txt:
-                        window.after(0, lambda: (text_widget.insert("end", f"{txt}\n"), text_widget.see("end")))
-                threading.Thread(target=_do_transcribe, args=(gained,), daemon=True).start()
-        threading.Thread(target=_loop, daemon=True).start()
-
-    tk.Button(ctrl_frame, text="Start", command=_start).pack(side="left", padx=(0, 6))
-    tk.Button(ctrl_frame, text="Stop", command=_stop).pack(side="left")
-    tk.Button(ctrl_frame, text="Close", command=lambda: (_stop(), window.destroy())).pack(side="right")
-
-    window.protocol("WM_DELETE_WINDOW", lambda: (_stop(), window.destroy()))
-    if parent is None:
-        window.mainloop()
-    return window
-
-
 def handle_incoming_text(user_text: str, serial_ctrl: Optional[SerialController] = None, text_widget=None) -> None:
     system_prompt = (
         "You are an assistant that MUST respond with a single, valid JSON object and NOTHING else.\n"
@@ -745,13 +382,6 @@ def handle_incoming_text(user_text: str, serial_ctrl: Optional[SerialController]
         text_widget.see("end")
     if serial_ctrl:
         serial_ctrl.send_animation(animation, reply_text)
-    wav = tts_synthesize_to_wav(reply_text)
-    if wav:
-        ok = play_audio_bytes(wav)
-        if not ok:
-            log_line("TTS", "[TTS] audio playback failed")
-    else:
-        log_line("TTS", f"[TTS] no audio produced; would reply: {reply_text}")
 
 
 def list_linux_video_indices(max_cameras: int) -> List[int]:
@@ -864,7 +494,7 @@ def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]
     root.bind_all("<Button-5>", _on_mousewheel)
 
     tk.Label(frame, text="Face Tracking Setup", font=("DejaVu Sans", 11, "bold")).pack(anchor="w")
-    tk.Label(frame, text="Configure camera and audio settings.").pack(anchor="w", pady=(4, 8))
+    tk.Label(frame, text="Configure camera and serial settings.").pack(anchor="w", pady=(4, 8))
 
     camera_frame = tk.LabelFrame(frame, text="Camera", padx=10, pady=10)
     camera_frame.pack(fill="x", pady=(0, 10))
@@ -899,68 +529,6 @@ def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]
     tk.Label(serial_frame, text="Baudrate:").grid(row=2, column=0, sticky="w", pady=(8, 0))
     tk.Entry(serial_frame, textvariable=baudrate_var, width=10).grid(row=2, column=1, sticky="w", padx=8, pady=(8, 0))
 
-    # --- Microphone selection / text input ---
-    def _collect_input_devices() -> List[Tuple[str, str, Optional[int]]]:
-        devices: List[Tuple[str, str, Optional[int]]] = []
-        scanned = scan_alsa_devices()
-        for display_name, device_id in scanned:
-            devices.append((display_name, "arecord", None))
-        if not devices:
-            log_line("STT", "[STT] No ALSA devices found. Using plughw defaults.")
-            if shutil.which("arecord"):
-                devices.append(("ALSA plughw:1,0", "arecord", None))
-                devices.append(("ALSA plughw:0,0", "arecord", None))
-        return devices
-
-    mic_device_entries = _collect_input_devices()
-    mic_support = bool(mic_device_entries)
-
-    mic_frame = tk.LabelFrame(frame, text="Microphone / LLM Test", padx=10, pady=10)
-    mic_frame.pack(fill="x", pady=(0, 10))
-
-    tk.Label(mic_frame, text="Input device:").grid(row=0, column=0, sticky="w")
-    mic_options = ["None"] + [entry[0] for entry in mic_device_entries]
-    mic_default = mic_options[1] if len(mic_options) > 1 else "None"
-    mic_var = tk.StringVar(value=mic_default)
-    mic_menu = tk.OptionMenu(mic_frame, mic_var, *mic_options)
-    mic_menu.grid(row=0, column=1, sticky="w", padx=8)
-
-    mic_hint = tk.Label(mic_frame, text="" if mic_support else "No input devices detected.", fg="#9b2c2c")
-    mic_hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6,0))
-
-    tk.Label(mic_frame, text="ALSA device string:").grid(row=2, column=0, sticky="w", pady=(6,0))
-    mic_alsa_var = tk.StringVar(value="hw:1,0")
-    tk.Entry(mic_frame, textvariable=mic_alsa_var, width=18).grid(row=2, column=1, sticky="w", padx=8, pady=(6,0))
-
-    mic_cont_var = tk.BooleanVar(value=True)
-    tk.Checkbutton(mic_frame, text="Record continuously (background)", variable=mic_cont_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8,0))
-
-    def _refresh_mic_devices() -> None:
-        nonlocal mic_device_entries
-        mic_device_entries = _collect_input_devices()
-        updated = ["None"] + [entry[0] for entry in mic_device_entries]
-        menu = mic_menu["menu"]
-        menu.delete(0, "end")
-        for option in updated:
-            menu.add_command(label=option, command=lambda value=option: mic_var.set(value))
-        mic_var.set(updated[1] if len(updated) > 1 else "None")
-        mic_hint.config(text="" if mic_device_entries else "No input devices detected.")
-
-    def _dump_alsa_devices() -> None:
-        try:
-            output = subprocess.check_output(["arecord", "-l"], text=True, stderr=subprocess.STDOUT)
-            for line in output.splitlines():
-                log_line("STAT", f"[ALSA] {line}")
-        except Exception as exc:
-            messagebox.showerror("ALSA error", str(exc))
-
-    tk.Button(mic_frame, text="Rescan Devices", command=_refresh_mic_devices).grid(row=5, column=0, sticky="w", padx=8, pady=(8,0))
-    tk.Button(mic_frame, text="List ALSA", command=_dump_alsa_devices).grid(row=5, column=1, sticky="w", padx=8, pady=(8,0))
-
-    # Chat window is launched after Start if mic is None.
-
-    
-
     log_frame = tk.LabelFrame(frame, text="Log Display", padx=10, pady=10)
     log_frame.pack(fill="x", pady=(0, 10))
 
@@ -980,8 +548,8 @@ def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]
             selected_log_kinds["value"] = None
         elif mode == "Tracking":
             selected_log_kinds["value"] = ["POS", "STAT"]
-        elif mode == "LLM/Audio":
-            selected_log_kinds["value"] = ["TEXT", "ANIM", "AUDIO", "LLM", "STT", "TTS"]
+        elif mode == "LLM":
+            selected_log_kinds["value"] = ["ANIM", "LLM"]
         else:
             raw = log_custom_var.get().strip()
             if not raw:
@@ -1065,19 +633,6 @@ def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]
     idx = selected_index["value"]
     if idx is None or not (0 <= idx < len(cameras)):
         return None
-    manual_alsa = mic_alsa_var.get().strip()
-    if mic_var.get() == "None":
-        mic_device_value = None
-    elif manual_alsa:
-        mic_device_value = f"alsa:{manual_alsa}"
-    else:
-        mic_device_value = mic_var.get()
-
-    if mic_device_value:
-        proc = multiprocessing.Process(target=start_realtime_stt_window, args=(mic_device_value,))
-        proc.daemon = False
-        proc.start()
-
     return CameraSelection(
         camera=cameras[idx],
         resolution=selected_resolution["value"],
@@ -1085,8 +640,6 @@ def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]
         serial_port=selected_port["value"],
         serial_baudrate=selected_baudrate["value"],
         log_display_kinds=selected_log_kinds["value"],
-        mic_device=mic_device_value,
-        mic_continuous=mic_cont_var.get(),
     )
 
 
@@ -1136,8 +689,6 @@ def run_face_tracking(
     log_display_kinds: Optional[List[str]] = None,
     serial_port: Optional[str] = None,
     serial_baudrate: int = 115200,
-    mic_device: Optional[str] = None,
-    mic_continuous: bool = False,
 ) -> None:
     set_log_display_kinds(log_display_kinds)
     cap = open_camera(camera_index)
@@ -1159,28 +710,6 @@ def run_face_tracking(
         except Exception as exc:
             log_line("ERROR", f"[Serial] init failed: {exc}", always=True)
             serial_ctrl = None
-
-    stop_event = threading.Event()
-    mic_thread: Optional[threading.Thread] = None
-    if mic_continuous and mic_device:
-        backend, index = parse_mic_label(mic_device)
-        if backend:
-            def _mic_loop() -> None:
-                log_line("STT", "[STT] continuous mic recording started")
-                while not stop_event.is_set():
-                    audio_bytes = record_audio_chunk(backend, index)
-                    if not audio_bytes:
-                        log_line("STT", "[STT] recording failed")
-                        time.sleep(1.0)
-                        continue
-                    text = transcribe_audio_bytes(audio_bytes)
-                    if text:
-                        log_line("STT", f"[STT] {text}")
-                        handle_incoming_text(text, serial_ctrl)
-                    time.sleep(0.2)
-
-            mic_thread = threading.Thread(target=_mic_loop, daemon=True)
-            mic_thread.start()
 
     detector = None
     window_name = f"Face Tracking - Camera {camera_index}"
@@ -1241,7 +770,6 @@ def run_face_tracking(
             if key in (27, ord("q")):
                 break
     finally:
-        stop_event.set()
         cap.release()
         if detector is not None:
             detector.close()
@@ -1268,14 +796,11 @@ def print_backend_help() -> None:
     print("=" * 60)
     print("Core Features:")
     print("  1. Real-time face detection using MediaPipe")
-    print("  2. Continuous microphone STT -> LLM -> TTS on this PC")
+    print("  2. LLM chat replies via the local chat window")
     print("  3. Send POS + ANIM over serial (no audio over serial)")
     print()
     print("LLM Features:")
-    print("  - Transcribe microphone audio using Whisper")
     print("  - Send to OpenRouter LLM (requires API key in api_key_openrouterai)")
-    print("  - Synthesize response to audio using espeak/pyttsx3")
-    print("  - Play audio locally on this PC")
     print()
     print("Example usage:")
     print("  # Interactive camera selection:")
@@ -1311,8 +836,6 @@ def main() -> None:
         model_selection = selected.model_selection
         target_resolution = selected.resolution
         log_display_kinds = selected.log_display_kinds
-        mic_device = selected.mic_device
-        mic_continuous = selected.mic_continuous
         serial_port = selected.serial_port
         serial_baudrate = selected.serial_baudrate
     else:
@@ -1320,15 +843,12 @@ def main() -> None:
         model_selection = args.model_selection
         target_resolution = None
         log_display_kinds = None
-        mic_device = None
-        mic_continuous = False
         serial_port = args.serial_port
         serial_baudrate = args.serial_baudrate
 
-    if mic_device is None:
-        proc = multiprocessing.Process(target=start_chat_window, args=(serial_port, serial_baudrate))
-        proc.daemon = False
-        proc.start()
+    proc = multiprocessing.Process(target=start_chat_window, args=(serial_port, serial_baudrate))
+    proc.daemon = False
+    proc.start()
 
     run_face_tracking(
         camera_index=cam_index,
@@ -1338,8 +858,6 @@ def main() -> None:
         log_display_kinds=log_display_kinds,
         serial_port=serial_port,
         serial_baudrate=serial_baudrate,
-        mic_device=mic_device,
-        mic_continuous=mic_continuous,
     )
 
 
