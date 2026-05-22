@@ -18,6 +18,9 @@ __pycache__/
 #python models
 .models
 
+#wakeword moddel training files
+wakeword_moddel_creation/
+
 #api keys
 api_key_openrouterai
 hed running pip install"
