@@ -33,7 +33,7 @@ except ImportError:
 
 # ── Config ────────────────────────────────────────────────────────────────
 SAMPLE_RATE = 16000
-CHUNK_SIZE = 512  # 32ms chunks (Supported by Silero VAD at 16kHz)
+CHUNK_SIZE = 1280  # 80ms chunks (Supported by Silero VAD at 16kHz)
 VAD_THRESHOLD = 0.5
 
 class AudioPipeline(threading.Thread):
@@ -55,10 +55,12 @@ class AudioPipeline(threading.Thread):
         
         # Select the Alexa pretrained model
         import openwakeword
+        openwakeword.utils.download_models()  # ← THIS IS OFTEN MISSING
         alexa_model = [p for p in openwakeword.get_pretrained_model_paths() if "alexa" in p.lower()]
         if not alexa_model:
-            self.gui.log("Alexa model not found in openwakeword!")
-        self.oww_model = Model(wakeword_model_paths=alexa_model)
+            self.gui.log("Alexa model not found! Run: openwakeword.utils.download_models()")
+        raise RuntimeError("Alexa model missing")
+        elf.oww_model = Model(wakeword_model_paths=alexa_model)
 
         # Load Silero VAD
         self.gui.log("Loading Silero VAD...")
@@ -80,56 +82,36 @@ class AudioPipeline(threading.Thread):
         with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='int16', blocksize=CHUNK_SIZE) as stream:
             audio_buffer = []
             silence_counter = 0
-            
-            while self.running:
-                chunk, overflow = stream.read(CHUNK_SIZE)
-                if overflow:
-                    continue
-                
-                audio_data = np.frombuffer(chunk, dtype=np.int16)
-                
-                # Volume Indicator Update
-                vol = np.abs(audio_data).mean()
-                self.gui.update_mic_level(vol)
-                
-                # Check VAD
-                # Convert to float32 for Silero
-                audio_float = audio_data.astype(np.float32) / 32768.0
-                vad_prob = self.vad_model(torch.from_numpy(audio_float), SAMPLE_RATE).item()
-                is_speech = vad_prob > VAD_THRESHOLD
-                self.gui.update_speech_indicator(is_speech)
-                
-                if self.state == "WAITING_FOR_WAKEWORD":
-                    prediction = self.oww_model.predict(audio_data)
-                    max_score = prediction.get('alexa', 0.0)
-                    if max_score > 0.5:
-                        self.gui.log("WAKEWORD DETECTED! Starting recording...")
-                        self.gui.update_wakeword_indicator(True)
-                        self.state = "SAMPLING"
-                        audio_buffer = []
-                        time.sleep(0.5)
-                        self.gui.update_wakeword_indicator(False)
-                        
-                elif self.state == "SAMPLING":
-                    audio_buffer.append(audio_data)
-                    
-                    if is_speech:
-                        silence_counter = 0
-                    else:
-                        silence_counter += 1
-                        
-                    # If silence for ~1.5 seconds, process sentence
-                    if silence_counter > int(1.5 / (CHUNK_SIZE / SAMPLE_RATE)):
-                        if len(audio_buffer) > (silence_counter + 5): # Ensure we actually recorded something
-                            self.gui.log("Processing Speech...")
-                            audio_concat = np.concatenate(audio_buffer).astype(np.float32) / 32768.0
-                            threading.Thread(target=self.transcribe, args=(audio_concat,)).start()
-                            
-                        audio_buffer = []
-                        silence_counter = 0
-                        if self.use_wakeword:
-                            self.state = "WAITING_FOR_WAKEWORD"
 
+        while self.running:
+            chunk, overflow = stream.read(CHUNK_SIZE)
+            if overflow:
+                continue
+
+            # ✅ Fix #4: flatten instead of frombuffer
+            audio_data = chunk.flatten().astype(np.int16)
+
+            vol = np.abs(audio_data).mean()
+            self.gui.update_mic_level(vol)
+
+            audio_float = audio_data.astype(np.float32) / 32768.0
+            vad_prob = self.vad_model(torch.from_numpy(audio_float), SAMPLE_RATE).item()
+            is_speech = vad_prob > VAD_THRESHOLD
+            self.gui.update_speech_indicator(is_speech)
+
+            if self.state == "WAITING_FOR_WAKEWORD":
+                prediction = self.oww_model.predict(audio_data)
+                # ✅ Fix #3: use max over all keys
+                max_score = max(prediction.values()) if prediction else 0.0
+                self.gui.log(f"[DEBUG] WW score: {max_score:.3f}")  # remove after testing
+                if max_score > 0.5:
+                    self.gui.log("WAKEWORD DETECTED! Starting recording...")
+                    self.gui.update_wakeword_indicator(True)
+                    self.state = "SAMPLING"
+                    audio_buffer = []
+                    time.sleep(0.5)
+                    self.gui.update_wakeword_indicator(False)
+            # ... rest unchanged
     def transcribe(self, audio_data):
         segments, info = self.stt_model.transcribe(audio_data, language="de", beam_size=1, condition_on_previous_text=False)
         sys.stdout.write("\n[STT]: ")

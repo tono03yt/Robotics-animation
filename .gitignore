@@ -3,6 +3,10 @@
 venv/
 env/
 
+venv_wakeword/
+
+jupyter_env/
+
 # Python cache and bytecode
 __pycache__/
 *.py[cod]
