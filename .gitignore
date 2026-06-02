@@ -6,6 +6,7 @@ env/
 venv_wakeword/
 
 jupyter_env/
+tts_models/
 
 # Python cache and bytecode
 __pycache__/
