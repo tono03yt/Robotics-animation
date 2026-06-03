@@ -17,11 +17,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
-try:
-    import serial
-except Exception:
-    serial = None  # type: ignore
-
 if os.name == "posix":
     os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
     os.environ.setdefault("PYTHONNOUSERSITE", "1")
@@ -211,8 +206,7 @@ class CameraSelection:
     camera: CameraInfo
     resolution: Tuple[int, int]
     model_selection: int
-    serial_port: Optional[str]           = None
-    serial_baudrate: int                  = 115200
+    socket_path:       Optional[str]           = None
     log_display_kinds: Optional[List[str]] = None
     use_wakeword: bool                    = False
     tts_enabled: bool                     = True
@@ -279,75 +273,59 @@ def log_line(kind: str, message: str, *, always: bool = False) -> None:
             print(colorize(message, Ansi.DIM), flush=True)
 
 
-def detect_serial_ports() -> List[str]:
-    ports: List[str] = []
-    for pattern in ["ttyUSB*", "ttyACM*", "ttyS*"]:
-        for path in Path("/dev").glob(pattern):
-            ports.append(str(path))
-    for path in Path("/dev/pts").glob("*"):
-        if path.name.isdigit():
-            ports.append(str(path))
-    return sorted(set(ports))
+class UnixSocketController:
+    """Sends newline-delimited JSON to a C program via Unix domain socket."""
 
+    DEFAULT_PATH = "/tmp/robot_pipeline.sock"
 
-def get_serial_port_label(port: str) -> str:
-    if "USB" in port:
-        return f"{port} (USB)"
-    if "ACM" in port:
-        return f"{port} (Nano)"
-    return port
-
-
-class SerialController:
-    def __init__(self, port: str, baudrate: int = 115200, timeout: float = 1.0) -> None:
-        if serial is None:
-            raise RuntimeError("pyserial is not installed.")
-        self.port      = port
-        self.baudrate  = baudrate
-        self.timeout   = timeout
-        self.ser: Any  = None
-        self.connected = False
+    def __init__(self, socket_path: str = DEFAULT_PATH) -> None:
+        self.socket_path = socket_path
+        self.connected   = False
+        self._sock: Any  = None
+        self._lock       = threading.Lock()
 
     def connect(self) -> bool:
+        import socket as _socket
         try:
-            self.ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
-            time.sleep(0.5)
+            sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            sock.connect(self.socket_path)
+            self._sock     = sock
             self.connected = True
-            log_line("STAT", f"[Serial] Connected to {self.port} at {self.baudrate} baud")
+            log_line("STAT", f"[IPC] Connected to Unix socket: {self.socket_path}")
             return True
         except Exception as exc:
-            log_line("ERROR", f"[Serial] Failed to connect: {exc}", always=True)
+            log_line("ERROR", f"[IPC] Failed to connect to {self.socket_path}: {exc}", always=True)
             self.connected = False
             return False
 
     def disconnect(self) -> None:
-        if self.ser and getattr(self.ser, "isOpen", lambda: False)():
-            try:
-                self.ser.close()
-            finally:
-                self.connected = False
-                log_line("STAT", "[Serial] Disconnected")
+        with self._lock:
+            if self._sock:
+                try:
+                    self._sock.close()
+                except Exception:
+                    pass
+                self._sock = None
+            self.connected = False
+        log_line("STAT", "[IPC] Disconnected")
+
+    def _send(self, msg: dict) -> None:
+        if not self.connected or not self._sock:
+            return
+        try:
+            data = (json.dumps(msg) + "\n").encode("utf-8")
+            with self._lock:
+                self._sock.sendall(data)
+        except Exception as exc:
+            log_line("ERROR", f"[IPC] send failed: {exc}", always=True)
+            self.connected = False
 
     def send_position_vector(self, x_error: float, y_error: float, confidence: float) -> None:
-        if not self.connected or not self.ser:
-            return
-        try:
-            msg = f"POS,{x_error:.4f},{y_error:.4f},{confidence:.2f}"
-            self.ser.write(msg.encode("utf-8"))
-        except Exception as exc:
-            log_line("ERROR", f"[Serial] POS send failed: {exc}", always=True)
-            self.connected = False
+        self._send({"type": "pos", "x": round(x_error, 4),
+                    "y": round(y_error, 4), "conf": round(confidence, 2)})
 
     def send_animation(self, animation: str, text: Optional[str] = None) -> None:
-        if not self.connected or not self.ser:
-            return
-        try:
-            payload = text or ""
-            msg = f"ANIM,{animation},{payload}"
-            self.ser.write(msg.encode("utf-8"))
-        except Exception as exc:
-            log_line("ERROR", f"[Serial] ANIM send failed: {exc}", always=True)
-            self.connected = False
+        self._send({"type": "anim", "animation": animation, "text": text or ""})
 
 
 # ── LLM helpers ───────────────────────────────────────────────────────────────
@@ -422,7 +400,7 @@ _SYSTEM_PROMPT = (
 
 def handle_incoming_text(
     user_text: str,
-    serial_ctrl: Optional[SerialController] = None,
+    ipc_ctrl: Optional[UnixSocketController] = None,
     text_widget=None,
     tts_enabled: bool = False,
 ) -> None:
@@ -451,8 +429,8 @@ def handle_incoming_text(
         msg = f"[LLM | {animation}] {reply_text}\n"
         text_widget.after(0, lambda m=msg: (text_widget.insert("end", m), text_widget.see("end")))
 
-    if serial_ctrl:
-        serial_ctrl.send_animation(animation, reply_text)
+    if ipc_ctrl:
+        ipc_ctrl.send_animation(animation, reply_text)
 
     if tts_enabled:
         try:
@@ -641,19 +619,19 @@ class AudioPipeline(threading.Thread):
 
 # ── Wakeword mode GUI window ──────────────────────────────────────────────────
 def _start_wakeword_gui(
-    serial_port: Optional[str], serial_baudrate: int, tts_enabled: bool
+    socket_path: Optional[str], tts_enabled: bool
 ) -> None:
     import tkinter as tk
     from tkinter import ttk
 
-    serial_ctrl: Optional[SerialController] = None
-    if serial_port:
+    ipc_ctrl: Optional[UnixSocketController] = None
+    if socket_path:
         try:
-            serial_ctrl = SerialController(port=serial_port, baudrate=serial_baudrate)
-            if not serial_ctrl.connect():
-                serial_ctrl = None
+            ipc_ctrl = UnixSocketController(socket_path=socket_path)
+            if not ipc_ctrl.connect():
+                ipc_ctrl = None
         except Exception as e:
-            log_line("ERROR", f"[WW GUI] Serial error: {e}", always=True)
+            log_line("ERROR", f"[WW GUI] IPC error: {e}", always=True)
 
     root = tk.Tk()
     root.title("Voice Pipeline")
@@ -724,7 +702,7 @@ def _start_wakeword_gui(
             result_var.set(text)
             threading.Thread(
                 target=handle_incoming_text,
-                args=(text, serial_ctrl, None, tts_enabled),
+                args=(text, ipc_ctrl, None, tts_enabled),
                 daemon=True,
             ).start()
 
@@ -776,8 +754,8 @@ def _start_wakeword_gui(
         if pipeline_holder[0]:
             pipeline_holder[0].stop()
             pipeline_holder[0].join(timeout=2)
-        if serial_ctrl:
-            serial_ctrl.disconnect()
+        if ipc_ctrl:
+            ipc_ctrl.disconnect()
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
@@ -786,7 +764,7 @@ def _start_wakeword_gui(
 
 # ── Chat window (text input + optional mic toggle) ────────────────────────────
 def start_chat_window(
-    serial_port: Optional[str], serial_baudrate: int, tts_enabled: bool = True
+    socket_path: Optional[str], tts_enabled: bool = True
 ) -> None:
     try:
         import tkinter as tk
@@ -794,14 +772,14 @@ def start_chat_window(
         log_line("ERROR", f"[Chat] Tkinter not available: {exc}", always=True)
         return
 
-    serial_ctrl: Optional[SerialController] = None
-    if serial_port:
+    ipc_ctrl: Optional[UnixSocketController] = None
+    if socket_path:
         try:
-            serial_ctrl = SerialController(port=serial_port, baudrate=serial_baudrate)
-            if not serial_ctrl.connect():
-                serial_ctrl = None
+            ipc_ctrl = UnixSocketController(socket_path=socket_path)
+            if not ipc_ctrl.connect():
+                ipc_ctrl = None
         except Exception as e:
-            log_line("ERROR", f"[Chat] Serial error: {e}", always=True)
+            log_line("ERROR", f"[Chat] IPC error: {e}", always=True)
 
     root = tk.Tk()
     root.title("LLM Chat & Audio Controls")
@@ -830,7 +808,7 @@ def start_chat_window(
                 text_widget.see("end")
                 threading.Thread(
                     target=handle_incoming_text,
-                    args=(text, serial_ctrl, text_widget, tts_var.get()),
+                    args=(text, ipc_ctrl, text_widget, tts_var.get()),
                     daemon=True,
                 ).start()
 
@@ -869,7 +847,7 @@ def start_chat_window(
         text_widget.see("end")
         threading.Thread(
             target=handle_incoming_text,
-            args=(user_text, serial_ctrl, text_widget, tts_var.get()),
+            args=(user_text, ipc_ctrl, text_widget, tts_var.get()),
             daemon=True,
         ).start()
 
@@ -891,8 +869,8 @@ def start_chat_window(
 
     if pipeline_holder[0]:
         pipeline_holder[0].stop()
-    if serial_ctrl:
-        serial_ctrl.disconnect()
+    if ipc_ctrl:
+        ipc_ctrl.disconnect()
 
 
 # ── Camera discovery & selection window ──────────────────────────────────────
@@ -944,26 +922,20 @@ def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]
         if not 0 <= idx < len(cameras):
             return None
         resolution  = RESOLUTION_PRESETS[1][1]
-        serial_port = input("Serial port (empty for none): ").strip() or None
-        baud_text   = input("Baudrate [115200]: ").strip()
-        baudrate    = int(baud_text) if baud_text.isdigit() else 115200
+        socket_input = input(f"Unix socket path [{UnixSocketController.DEFAULT_PATH}] (empty for default): ").strip()
+        socket_path  = socket_input or UnixSocketController.DEFAULT_PATH
         return CameraSelection(
             camera=cameras[idx], resolution=resolution,
-            model_selection=0, serial_port=serial_port, serial_baudrate=baudrate,
+            model_selection=0, socket_path=socket_path,
         )
 
     selected_index        = {"value": None}
     selected_resolution   = {"value": RESOLUTION_PRESETS[1][1]}
     selected_model        = {"value": 0}
-    selected_port         = {"value": None}
-    selected_baudrate     = {"value": 115200}
+    selected_socket_path  = {"value": UnixSocketController.DEFAULT_PATH}
     selected_log_kinds    = {"value": None}
     selected_use_wakeword = {"value": False}
     selected_tts_enabled  = {"value": True}
-
-    ports       = detect_serial_ports()
-    port_labels = ["None (tracking only)"] + [get_serial_port_label(p) for p in ports]
-    port_values = [None] + ports
 
     root = tk.Tk()
     root.title("Select Webcam Settings")
@@ -1017,22 +989,15 @@ def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]
         row=1, column=1, sticky="w", padx=8, pady=(8, 0)
     )
 
-    # Serial section
-    serial_frame = tk.LabelFrame(frame, text="Serial", padx=10, pady=10)
-    serial_frame.pack(fill="x", pady=(0, 10))
-    serial_var      = tk.StringVar(value=port_labels[0])
-    baudrate_var    = tk.StringVar(value="115200")
-    manual_port_var = tk.StringVar(value="")
-    tk.Label(serial_frame, text="Port:").grid(row=0, column=0, sticky="w")
-    tk.OptionMenu(serial_frame, serial_var, *port_labels).grid(row=0, column=1, sticky="w", padx=8)
-    tk.Label(serial_frame, text="Or manual tty:").grid(row=1, column=0, sticky="w", pady=(8, 0))
-    tk.Entry(serial_frame, textvariable=manual_port_var, width=24).grid(
-        row=1, column=1, sticky="w", padx=8, pady=(8, 0)
-    )
-    tk.Label(serial_frame, text="Baudrate:").grid(row=2, column=0, sticky="w", pady=(8, 0))
-    tk.Entry(serial_frame, textvariable=baudrate_var, width=10).grid(
-        row=2, column=1, sticky="w", padx=8, pady=(8, 0)
-    )
+    # IPC section
+    ipc_frame = tk.LabelFrame(frame, text="Unix Socket IPC", padx=10, pady=10)
+    ipc_frame.pack(fill="x", pady=(0, 10))
+    socket_path_var = tk.StringVar(value=UnixSocketController.DEFAULT_PATH)
+    tk.Label(ipc_frame, text="Socket path:").grid(row=0, column=0, sticky="w")
+    tk.Entry(ipc_frame, textvariable=socket_path_var, width=36).grid(
+        row=0, column=1, sticky="w", padx=8)
+    tk.Label(ipc_frame, text="(leave blank to disable IPC)", fg="#888").grid(
+        row=1, column=1, sticky="w", padx=8, pady=(2, 0))
 
     # Log display section
     log_frame = tk.LabelFrame(frame, text="Log Display", padx=10, pady=10)
@@ -1087,22 +1052,9 @@ def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]
                 selected_resolution["value"] = size
                 break
 
-    def sync_serial() -> None:
-        manual = manual_port_var.get().strip()
-        if manual:
-            selected_port["value"] = manual
-            return
-        choice = serial_var.get()
-        for i, label in enumerate(port_labels):
-            if label == choice:
-                selected_port["value"] = port_values[i]
-                break
-
-    def sync_baudrate() -> None:
-        try:
-            selected_baudrate["value"] = int(baudrate_var.get().strip())
-        except ValueError:
-            selected_baudrate["value"] = 115200
+    def sync_socket_path() -> None:
+        val = socket_path_var.get().strip()
+        selected_socket_path["value"] = val if val else None
 
     def sync_log_display() -> None:
         mode = log_mode_var.get()
@@ -1121,14 +1073,11 @@ def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]
             )
 
     resolution_var.trace_add("write",  lambda *_: sync_resolution())
-    serial_var.trace_add("write",      lambda *_: sync_serial())
-    manual_port_var.trace_add("write", lambda *_: sync_serial())
-    baudrate_var.trace_add("write",    lambda *_: sync_baudrate())
+    socket_path_var.trace_add("write", lambda *_: sync_socket_path())
     log_mode_var.trace_add("write",    lambda *_: sync_log_display())
     log_custom_var.trace_add("write",  lambda *_: sync_log_display())
     sync_resolution()
-    sync_serial()
-    sync_baudrate()
+    sync_socket_path()
     sync_log_display()
 
     def open_selected() -> None:
@@ -1139,6 +1088,7 @@ def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]
         selected_index["value"]        = selection[0]
         selected_use_wakeword["value"] = use_wakeword_var.get()
         selected_tts_enabled["value"]  = tts_enabled_var.get()
+        sync_socket_path()
         sync_log_display()
         root.destroy()
 
@@ -1163,8 +1113,7 @@ def select_camera_window(cameras: List[CameraInfo]) -> Optional[CameraSelection]
         camera            = cameras[idx],
         resolution        = selected_resolution["value"],
         model_selection   = selected_model["value"],
-        serial_port       = selected_port["value"],
-        serial_baudrate   = selected_baudrate["value"],
+        socket_path       = selected_socket_path["value"],
         log_display_kinds = selected_log_kinds["value"],
         use_wakeword      = selected_use_wakeword["value"],
         tts_enabled       = selected_tts_enabled["value"],
@@ -1218,8 +1167,7 @@ def run_face_tracking(
     min_detection_confidence: float,
     target_resolution: Optional[Tuple[int, int]] = None,
     log_display_kinds: Optional[List[str]] = None,
-    serial_port: Optional[str] = None,
-    serial_baudrate: int = 115200,
+    socket_path: Optional[str] = None,
 ) -> None:
     set_log_display_kinds(log_display_kinds)
     cap = open_camera(camera_index)
@@ -1231,14 +1179,14 @@ def run_face_tracking(
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(h))
         cap.set(cv2.CAP_PROP_FPS,          30.0)
 
-    serial_ctrl: Optional[SerialController] = None
-    if serial_port:
+    ipc_ctrl: Optional[UnixSocketController] = None
+    if socket_path:
         try:
-            serial_ctrl = SerialController(port=serial_port, baudrate=serial_baudrate)
-            if not serial_ctrl.connect():
-                serial_ctrl = None
+            ipc_ctrl = UnixSocketController(socket_path=socket_path)
+            if not ipc_ctrl.connect():
+                ipc_ctrl = None
         except Exception as exc:
-            log_line("ERROR", f"[Serial] init failed: {exc}", always=True)
+            log_line("ERROR", f"[IPC] init failed: {exc}", always=True)
 
     detector    = None
     window_name = f"Face Tracking - Camera {camera_index}"
@@ -1280,16 +1228,16 @@ def run_face_tracking(
                     cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2, cv2.LINE_AA,
                 )
                 log_line("POS", f"[Tracking] POS {err_x:.4f},{err_y:.4f} conf={score:.2f}")
-                if serial_ctrl:
-                    serial_ctrl.send_position_vector(err_x, err_y, score)
+                if ipc_ctrl:
+                    ipc_ctrl.send_position_vector(err_x, err_y, score)
             else:
                 cv2.putText(
                     frame, "No face detected", (16, 32),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (70, 120, 240), 2, cv2.LINE_AA,
                 )
                 log_line("STAT", "[Tracking] No face detected")
-                if serial_ctrl:
-                    serial_ctrl.send_position_vector(0.0, 0.0, 0.0)
+                if ipc_ctrl:
+                    ipc_ctrl.send_position_vector(0.0, 0.0, 0.0)
 
             now  = time.time()
             fps  = 1.0 / max(1e-6, now - prev)
@@ -1307,8 +1255,8 @@ def run_face_tracking(
         if detector is not None:
             detector.close()
         cv2.destroyAllWindows()
-        if serial_ctrl:
-            serial_ctrl.disconnect()
+        if ipc_ctrl:
+            ipc_ctrl.disconnect()
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -1357,8 +1305,7 @@ def main() -> None:
         model_selection   = selected.model_selection
         target_resolution = selected.resolution
         log_display_kinds = selected.log_display_kinds
-        serial_port       = selected.serial_port
-        serial_baudrate   = selected.serial_baudrate
+        socket_path       = selected.socket_path
         use_wakeword      = selected.use_wakeword
         tts_enabled       = selected.tts_enabled
     else:
@@ -1366,18 +1313,17 @@ def main() -> None:
         model_selection   = args.model_selection
         target_resolution = None
         log_display_kinds = None
-        serial_port       = args.serial_port
-        serial_baudrate   = args.serial_baudrate
+        socket_path       = getattr(args, "socket_path", None)
         use_wakeword      = False
         tts_enabled       = True
 
     def launch_gui():
         if use_wakeword:
             print("[main] Starting Voice Pipeline (Wakeword mode)...")
-            _start_wakeword_gui(serial_port, serial_baudrate, tts_enabled)
+            _start_wakeword_gui(socket_path, tts_enabled)
         else:
             print("[main] Starting Chat Window...")
-            start_chat_window(serial_port, serial_baudrate, tts_enabled)
+            start_chat_window(socket_path, tts_enabled)
 
     proc = multiprocessing.Process(target=launch_gui)
     proc.daemon = False
@@ -1389,8 +1335,7 @@ def main() -> None:
         min_detection_confidence = args.min_detection_confidence,
         target_resolution        = target_resolution,
         log_display_kinds        = log_display_kinds,
-        serial_port              = serial_port,
-        serial_baudrate          = serial_baudrate,
+        socket_path              = socket_path,
     )
 
 
