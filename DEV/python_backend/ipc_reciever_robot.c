@@ -44,14 +44,14 @@ static struct timespec last_ts = {0};
 #define TILT_MIN 75.0f
 #define TILT_MAX 105.0f
 
-#define KP_X 20.0f
+#define KP_X 15.0f
 #define KI_X 0.8f
-#define KD_X 1.3f
+#define KD_X 0.95f
 
 
-#define KP_Y 20.0f
+#define KP_Y 15.0f
 #define KI_Y 0.6f
-#define KD_Y 1.3f
+#define KD_Y 0.95f
 
 #define INTEGRAL_LIMIT_X 20.0f
 #define INTEGRAL_LIMIT_Y 20.0f
