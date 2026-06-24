@@ -47,9 +47,14 @@ static struct timespec last_ts = {0};
 #define KI_X 0.8f
 #define KD_X 1.3f
 
-#define KP_Y 20.0f
-#define KI_Y 0.6f
-#define KD_Y 1.3f
+
+#define KP_X 18.0f
+#define KI_X 0.8f
+#define KD_X 0.0f
+
+#define KP_Y 18.0f
+#define KI_Y 0.7f
+#define KD_Y 0.0f
 
 #define INTEGRAL_LIMIT_X 20.0f
 #define INTEGRAL_LIMIT_Y 20.0f
