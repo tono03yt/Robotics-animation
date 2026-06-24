@@ -28,7 +28,6 @@ static char saved_port[256] = {0};
 static float pan_angle = 90.0f;
 static float tilt_angle = 90.0f;
 
-
 static float pan_integral = 0.0f;
 static float tilt_integral = 0.0f;
 static float last_x_error = 0.0f;
@@ -44,15 +43,13 @@ static struct timespec last_ts = {0};
 #define TILT_MIN 75.0f
 #define TILT_MAX 105.0f
 
+#define KP_X 20.0f
+#define KI_X 0.8f
+#define KD_X 1.3f
 
-
-#define Kp_x 18.0f
-#define Ki_x 0.8f
-#define Kd_x 0.0f
-
-#define Kp_y 18.0f
-#define Ki_y 0.7f
-#define Kd_y 0.0f
+#define KP_Y 20.0f
+#define KI_Y 0.6f
+#define KD_Y 1.3f
 
 #define INTEGRAL_LIMIT_X 20.0f
 #define INTEGRAL_LIMIT_Y 20.0f
