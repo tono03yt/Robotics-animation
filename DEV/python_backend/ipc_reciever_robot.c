@@ -152,10 +152,26 @@ static float get_dt_seconds(void) {
     return dt;
 }
 
+
+#define DEADBAND 0.12f
+#define PI_LIMIT 0.27f
+#define PD_LIMIT 0.33f
+
+#define KP_PAN  2.5f
+#define KI_PAN  0.03f
+#define KD_PAN  2.5f
+#define K_PD_PAN 3.5f
+
+#define KP_TILT 2.5f
+#define KI_TILT 0.03f
+#define KD_TILT 2.5f
+#define K_PD_TILT 2.8f
+
 static void handle_pos(float x, float y, float conf) {
     printf("[POS] x=%-8.4f y=%-8.4f conf=%.2f\n", x, y, conf);
 
-    float dt = get_dt_seconds();
+    // float dt = get_dt_seconds(); // Not strictly used for math to match Arduino 1:1, but keep for timing if needed
+    get_dt_seconds(); // call to keep timestamp updated
 
     if (conf < 0.5f) {
         pan_integral = 0.0f;
@@ -169,33 +185,70 @@ static void handle_pos(float x, float y, float conf) {
         if (tilt_angle > TILT_CENTER) tilt_angle -= 0.5f;
         else if (tilt_angle < TILT_CENTER) tilt_angle += 0.5f;
     } else {
-        float error_x = 0.0f;
-        float error_y = 0.0f;
+        float panError = x;
+        float tiltError = y;
 
-        if (x > deadzone_x || x < -deadzone_x) error_x = x;
-        if (y > deadzone_y || y < -deadzone_y) error_y = y;
+        // Totzone
+        if (panError > -DEADBAND && panError < DEADBAND) panError = 0.0f;
+        if (tiltError > -DEADBAND && tiltError < DEADBAND) tiltError = 0.0f;
 
-        pan_integral += error_x * dt;
-        tilt_integral += error_y * dt;
+        float panDerivative = panError - last_x_error;
+        float tiltDerivative = tiltError - last_y_error;
 
-        pan_integral = clampf(pan_integral, -INTEGRAL_LIMIT_X, INTEGRAL_LIMIT_X);
-        tilt_integral = clampf(tilt_integral, -INTEGRAL_LIMIT_Y, INTEGRAL_LIMIT_Y);
+        float absPan = (panError > 0.0f) ? panError : -panError;
+        float absTilt = (tiltError > 0.0f) ? tiltError : -tiltError;
 
-        float derivative_x = (error_x - last_x_error) / dt;
-        float derivative_y = (error_y - last_y_error) / dt;
+        // Integrator nur im PI-Bereich aktiv
+        if (absPan < PI_LIMIT) {
+            pan_integral += panError;    
+            pan_integral = clampf(pan_integral, -20.0f, 20.0f);
+        }
 
-        float out_x = KP_X * error_x + KI_X * pan_integral + KD_X * derivative_x;
-        float out_y = KP_Y * error_y + KI_Y * tilt_integral + KD_Y * derivative_y;
+        if (absTilt < PI_LIMIT) {
+            tilt_integral += tiltError;
+            tilt_integral = clampf(tilt_integral, -20.0f, 20.0f);
+        }
 
-        pan_angle += direction_x * out_x;
-        tilt_angle += direction_y * out_y;
+        // PI-Regler
+        float panPI = KP_PAN * panError + KI_PAN * pan_integral;
+        float tiltPI = KP_TILT * tiltError + KI_TILT * tilt_integral;
 
-        last_x_error = error_x;
-        last_y_error = error_y;
+        // PD-Regler
+        float panPD = K_PD_PAN * panError + KD_PAN * panDerivative;
+        float tiltPD = K_PD_TILT * tiltError + KD_TILT * tiltDerivative;
+
+        // Überblendfaktor
+        float panBlend;
+        float tiltBlend;
+
+        // PAN Blending
+        if (absPan <= PI_LIMIT) panBlend = 0.0f;
+        else if (absPan >= PD_LIMIT) panBlend = 1.0f;
+        else panBlend = (absPan - PI_LIMIT) / 0.06f;
+
+        // TILT Blending
+        if (absTilt <= PI_LIMIT) tiltBlend = 0.0f;
+        else if (absTilt >= PD_LIMIT) tiltBlend = 1.0f;
+        else tiltBlend = (absTilt - PI_LIMIT) / 0.06f;
+
+        // Gain Scheduling Output
+        float panOutput = (1.0f - panBlend) * panPI + panBlend * panPD;
+        float tiltOutput = (1.0f - tiltBlend) * tiltPI + tiltBlend * tiltPD;
+
+        // In your arduino code: panPos -= panOutput; tiltPos -= tiltOutput;
+        // In the original C script we used direction_x/y (1.0 and -1.0).
+        // I am subtracting directly to match the exact mathematical intent from your Arduino snippet.
+        // If the axes are inverted, change these to +=
+        pan_angle -= panOutput;
+        tilt_angle -= tiltOutput;           
+
+        last_x_error = panError;
+        last_y_error = tiltError;
     }
 
-    pan_angle = clampf(pan_angle, PAN_MIN, PAN_MAX);
-    tilt_angle = clampf(tilt_angle, TILT_MIN, TILT_MAX);
+    // Begrenzen (Matching your Arduino ranges while using the clamp function)
+    pan_angle = clampf(pan_angle, 20.0f, 160.0f);
+    tilt_angle = clampf(tilt_angle, 45.0f, 135.0f);
 
     ensure_serial_connection();
 
