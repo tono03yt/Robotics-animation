@@ -44,14 +44,14 @@ static struct timespec last_ts = {0};
 #define TILT_MIN 75.0f
 #define TILT_MAX 105.0f
 
-#define KP_X 15.0f
+#define KP_X 20.0f
 #define KI_X 0.8f
-#define KD_X 0.95f
+#define KD_X 1.3f
 
 
-#define KP_Y 15.0f
+#define KP_Y 20.0f
 #define KI_Y 0.6f
-#define KD_Y 0.95f
+#define KD_Y 1.3f
 
 #define INTEGRAL_LIMIT_X 20.0f
 #define INTEGRAL_LIMIT_Y 20.0f
@@ -212,6 +212,17 @@ static void handle_pos(float x, float y, float conf) {
 
 static void handle_anim(const char *animation, const char *text) {
     printf("[ANIM] animation=%-10s text=%s\n", animation, text);
+
+    ensure_serial_connection();
+    if (arduino_fd >= 0) {
+        char cmd[128];
+        snprintf(cmd, sizeof(cmd), "anim,%s\n", animation);
+        if (write(arduino_fd, cmd, strlen(cmd)) < 0) {
+            printf("[Serial] Connection lost during animation. Attempting to reconnect to %s...\n", saved_port);
+            close(arduino_fd);
+            arduino_fd = -1;
+        }
+    }
 }
 
 static int json_str(const char *json, const char *key, char *out, int out_sz) {
