@@ -3,7 +3,7 @@
 * IPC Receiver & Robot Controller (With Retry Logic)
 * ==============================================================================
 */
-
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +28,14 @@ static char saved_port[256] = {0};
 static float pan_angle = 90.0f;
 static float tilt_angle = 90.0f;
 
+
+static float pan_integral = 0.0f;
+static float tilt_integral = 0.0f;
+static float last_x_error = 0.0f;
+static float last_y_error = 0.0f;
+
+static struct timespec last_ts = {0};
+
 #define PAN_CENTER 90.0f
 #define PAN_MIN 60.0f
 #define PAN_MAX 120.0f
@@ -36,11 +44,21 @@ static float tilt_angle = 90.0f;
 #define TILT_MIN 75.0f
 #define TILT_MAX 105.0f
 
-#define Kp_x 18.0f
-#define Kp_y 12.0f
 
-#define deadzone_x 0.05f
-#define deadzone_y 0.05f
+
+#define Kp_x 18.0f
+#define Ki_x 0.8f
+#define Kd_x 0.0f
+
+#define Kp_y 18.0f
+#define Ki_y 0.7f
+#define Kd_y 0.0f
+
+#define INTEGRAL_LIMIT_X 20.0f
+#define INTEGRAL_LIMIT_Y 20.0f
+
+#define deadzone_x 0.1f
+#define deadzone_y 0.1f
 
 #define direction_x 1.0f
 #define direction_y 1.0f
@@ -118,31 +136,76 @@ static void ensure_serial_connection() {
     }
 }
 
+static float clampf(float v, float min, float max) {
+    if (v < min) return min;
+    if (v > max) return max;
+    return v;
+}
+
+static float get_dt_seconds(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    if (last_ts.tv_sec == 0 && last_ts.tv_nsec == 0) {
+        last_ts = now;
+        return 0.02f;
+    }
+
+    float dt = (float)(now.tv_sec - last_ts.tv_sec) +
+               (float)(now.tv_nsec - last_ts.tv_nsec) / 1000000000.0f;
+
+    last_ts = now;
+
+    if (dt < 0.001f) dt = 0.001f;
+    if (dt > 0.1f)   dt = 0.1f;
+    return dt;
+}
+
 static void handle_pos(float x, float y, float conf) {
     printf("[POS] x=%-8.4f y=%-8.4f conf=%.2f\n", x, y, conf);
 
+    float dt = get_dt_seconds();
+
     if (conf < 0.5f) {
+        pan_integral = 0.0f;
+        tilt_integral = 0.0f;
+        last_x_error = 0.0f;
+        last_y_error = 0.0f;
+
         if (pan_angle > PAN_CENTER) pan_angle -= 0.5f;
         else if (pan_angle < PAN_CENTER) pan_angle += 0.5f;
 
         if (tilt_angle > TILT_CENTER) tilt_angle -= 0.5f;
         else if (tilt_angle < TILT_CENTER) tilt_angle += 0.5f;
     } else {
-        if (x > deadzone_x || x < -deadzone_x) {
-            pan_angle = pan_angle + direction_x * Kp_x * x;
-        }
-        if (y > deadzone_y || y < -deadzone_y) {
-            tilt_angle = tilt_angle + direction_y * Kp_y * y;
-        }
+        float error_x = 0.0f;
+        float error_y = 0.0f;
+
+        if (x > deadzone_x || x < -deadzone_x) error_x = x;
+        if (y > deadzone_y || y < -deadzone_y) error_y = y;
+
+        pan_integral += error_x * dt;
+        tilt_integral += error_y * dt;
+
+        pan_integral = clampf(pan_integral, -INTEGRAL_LIMIT_X, INTEGRAL_LIMIT_X);
+        tilt_integral = clampf(tilt_integral, -INTEGRAL_LIMIT_Y, INTEGRAL_LIMIT_Y);
+
+        float derivative_x = (error_x - last_x_error) / dt;
+        float derivative_y = (error_y - last_y_error) / dt;
+
+        float out_x = KP_X * error_x + KI_X * pan_integral + KD_X * derivative_x;
+        float out_y = KP_Y * error_y + KI_Y * tilt_integral + KD_Y * derivative_y;
+
+        pan_angle += direction_x * out_x;
+        tilt_angle += direction_y * out_y;
+
+        last_x_error = error_x;
+        last_y_error = error_y;
     }
 
-    if (pan_angle < PAN_MIN) pan_angle = PAN_MIN;
-    if (pan_angle > PAN_MAX) pan_angle = PAN_MAX;
+    pan_angle = clampf(pan_angle, PAN_MIN, PAN_MAX);
+    tilt_angle = clampf(tilt_angle, TILT_MIN, TILT_MAX);
 
-    if (tilt_angle < TILT_MIN) tilt_angle = TILT_MIN;
-    if (tilt_angle > TILT_MAX) tilt_angle = TILT_MAX;
-
-    // Ensure serial connection is active before trying to write
     ensure_serial_connection();
 
     if (arduino_fd >= 0) {
