@@ -1,3 +1,4 @@
+#include <pthread.h>
 /*
 * ==============================================================================
 * IPC Receiver & Robot Controller (With Retry Logic)
@@ -59,7 +60,7 @@ static struct timespec last_ts = {0};
 #define deadzone_y 0.1f
 
 #define direction_x 1.0f
-#define direction_y 1.0f
+#define direction_y -1.0f
 
 static void cleanup(void) {
     if (arduino_fd >= 0) {
@@ -108,7 +109,7 @@ static int setup_serial(const char *port) {
     options.c_oflag &= ~OPOST;
 
     tcsetattr(fd, TCSANOW, &options);
-    fcntl(fd, F_SETFL, 0); 
+    fcntl(fd, F_SETFL, FNDELAY); 
 
     printf("[Serial] Connected to %s at 115200 baud.\n", port);
     sleep(2);
@@ -122,14 +123,6 @@ static void ensure_serial_connection() {
         arduino_fd = setup_serial(saved_port);
         if (arduino_fd < 0) {
             printf("[Serial] Could not open %s. Retrying in background...\n", saved_port);
-        }
-    } else {
-        // Test if the connection is still alive by sending a dummy newline
-        // If write fails, the Arduino was unplugged
-        if (write(arduino_fd, "\n", 1) < 0) {
-            printf("[Serial] Connection lost. Attempting to reconnect to %s...\n", saved_port);
-            close(arduino_fd);
-            arduino_fd = -1;
         }
     }
 }
@@ -209,7 +202,11 @@ static void handle_pos(float x, float y, float conf) {
     if (arduino_fd >= 0) {
         char cmd[32];
         snprintf(cmd, sizeof(cmd), "%d,%d\n", (int)pan_angle, (int)tilt_angle);
-        write(arduino_fd, cmd, strlen(cmd));
+        if (write(arduino_fd, cmd, strlen(cmd)) < 0) {
+            printf("[Serial] Connection lost. Attempting to reconnect to %s...\n", saved_port);
+            close(arduino_fd);
+            arduino_fd = -1;
+        }
     }
 }
 
@@ -267,7 +264,8 @@ static void dispatch(const char *line) {
     }
 }
 
-static void serve_client(int client_fd) {
+static void *client_thread(void *arg) {
+    int client_fd = (int)(intptr_t)arg;
     char buf[BUF_SIZE];
     char line[BUF_SIZE];
     int line_len = 0;
@@ -291,6 +289,8 @@ static void serve_client(int client_fd) {
         dispatch(line);
     }
     close(client_fd);
+    printf("[IPC] Python disconnected.\n");
+    return NULL;
 }
 
 static const char *select_socket_path(int argc, char *argv[]) {
@@ -374,8 +374,9 @@ int main(int argc, char *argv[]) {
         }
 
         printf("[IPC] Python connected.\n");
-        serve_client(client_fd);
-        printf("[IPC] Python disconnected — waiting for reconnect...\n");
+        pthread_t t;
+        pthread_create(&t, NULL, client_thread, (void *)(intptr_t)client_fd);
+        pthread_detach(t);
     }
 
     cleanup();
