@@ -390,7 +390,7 @@ def parse_llm_response_as_json(text: str) -> Optional[dict]:
 
 # ── LLM system prompt ─────────────────────────────────────────────────────────
 _SYSTEM_PROMPT = (
-    'You are an assistant that MUST respond with a single, valid JSON object and NOTHING else.\n'
+    'You are an assistant that MUST respond with a single, valid JSON object and NOTHING else. Do ONLY RESPOND IN GERMAN\n'
     'The JSON must have exactly two fields:\n'
     '  - "animation": either "speech" or "waving"\n'
     '  - "text": your reply as a string\n'
