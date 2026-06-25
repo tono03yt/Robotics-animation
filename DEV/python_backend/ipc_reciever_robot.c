@@ -33,21 +33,21 @@
 
 #define TILT_CENTER 90.0f
 #define TILT_MIN 75.0f
-#define TILT_MAX 90.0f
+#define TILT_MAX 105.0f
 
 /* PID Controller & Tracking Settings */
 #define DEADBAND 0.12f
-#define PI_LIMIT 0.5f
-#define PD_LIMIT 0.5f
+#define PI_LIMIT 0.27f
+#define PD_LIMIT 0.33f
 
-#define KP_PAN 18.5f
-#define KI_PAN 0.05f
-#define KD_PAN 5.0f
+#define KP_PAN 15.0f
+#define KI_PAN 0.03f
+#define KD_PAN 5.5f
 #define K_PD_PAN 3.5f
 
-#define KP_TILT 18.5f
-#define KI_TILT 0.05f
-#define KD_TILT 5.0f
+#define KP_TILT 15.0f
+#define KI_TILT 0.03f
+#define KD_TILT 5.5f
 #define K_PD_TILT 2.8f
 
 /* ==============================================================================
@@ -59,6 +59,10 @@ static int arduino_fd = -1;
 static char saved_port[256] = {0};
 
 /* Controller State */
+/* Rate Limiting State */
+static struct timespec last_send_ts = {0};
+#define SERIAL_UPDATE_INTERVAL 0.2f // 20 updates per second
+
 static float pan_angle = PAN_CENTER;
 static float tilt_angle = TILT_CENTER;
 static float pan_integral = 0.0f;
@@ -250,16 +254,25 @@ static void handle_pos(float x, float y, float conf) {
     pan_angle = clampf(pan_angle, 20.0f, 160.0f);
     tilt_angle = clampf(tilt_angle, 45.0f, 135.0f);
     
-    ensure_serial_connection();
-    
-    if (arduino_fd >= 0) {
-      char cmd[32];
-      snprintf(cmd, sizeof(cmd), "%d,%d\n", (int)pan_angle, (int)tilt_angle);
-      if (write(arduino_fd, cmd, strlen(cmd)) < 0) {
-        printf("[Serial] Connection lost. Attempting to reconnect to %s...\n", saved_port);
-        close(arduino_fd);
-        arduino_fd = -1;
-      }
+    // Rate Limit Serial Updates
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    float elapsed_send = (float)(now.tv_sec - last_send_ts.tv_sec) + 
+                         (float)(now.tv_nsec - last_send_ts.tv_nsec) / 1000000000.0f;
+                         
+    if (elapsed_send >= SERIAL_UPDATE_INTERVAL) {
+        last_send_ts = now;
+        
+        ensure_serial_connection();
+        if (arduino_fd >= 0) {
+          char cmd[32];
+          snprintf(cmd, sizeof(cmd), "%d,%d\n", (int)pan_angle, (int)tilt_angle);
+          if (write(arduino_fd, cmd, strlen(cmd)) < 0) {
+            printf("[Serial] Connection lost. Attempting to reconnect to %s...\n", saved_port);
+            close(arduino_fd);
+            arduino_fd = -1;
+          }
+        }
     }
   }
 }
