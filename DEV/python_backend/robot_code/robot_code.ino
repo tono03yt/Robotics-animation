@@ -28,29 +28,24 @@ SmoothServo tiltAxis;
 SmoothServo leftArmAxis;
 SmoothServo rightArmAxis;
 
-// Pins
 const uint8_t PAN_PIN = 9;
 const uint8_t TILT_PIN = 10;
 const uint8_t LEFT_ARM_PIN = 8;
 const uint8_t RIGHT_ARM_PIN = 7;
 
-// Centers
 const float PAN_CENTER = 90.0f;
 const float TILT_CENTER = 90.0f;
 const float LEFT_ARM_CENTER = 90.0f;
 const float RIGHT_ARM_CENTER = 90.0f;
 
-// Motion loop
-const unsigned long CONTROL_INTERVAL_MS = 10;   // 100 Hz
-const float SMOOTHING_FACTOR = 0.18f;           // raise for snappier tracking
+const unsigned long CONTROL_INTERVAL_MS = 10;
+const float SMOOTHING_FACTOR = 0.18f;
 const float POSITION_EPSILON = 0.02f;
 
-// Serial parser
 const byte NUM_CHARS = 64;
 char receivedChars[NUM_CHARS];
 bool newData = false;
 
-// Animation state
 enum AnimationType {
   ANIM_NONE = 0,
   ANIM_WAVE = 1,
@@ -60,7 +55,7 @@ enum AnimationType {
 bool animationActive = false;
 AnimationType currentAnimation = ANIM_NONE;
 unsigned long animationStartMs = 0;
-const unsigned long WAVE_DURATION_MS = 1800;
+const unsigned long WAVE_DURATION_MS = 1000;
 const unsigned long SPEECH_DURATION_MS = 1200;
 
 static void initServoState(
@@ -157,13 +152,11 @@ static void updateAnimationTargets() {
       return;
     }
 
-    float t = (float)elapsed / (float)WAVE_DURATION_MS;   // 0..1
-    float envelope = sinf(t * PI);                        // smooth raise/lower
-    float raise = 58.0f * envelope;
-    float waggle = 20.0f * sinf(t * 8.0f * PI) * envelope;
+    float t = (float)elapsed / (float)WAVE_DURATION_MS;
+    float wave = 18.0f * sinf(t * 4.0f * PI);
 
     leftArmAxis.targetDeg = LEFT_ARM_CENTER;
-    rightArmAxis.targetDeg = clampf(RIGHT_ARM_CENTER + raise + waggle, 25.0f, 170.0f);
+    rightArmAxis.targetDeg = clampf(RIGHT_ARM_CENTER + wave, 70.0f, 110.0f);
   }
   else if (currentAnimation == ANIM_SPEECH) {
     if (elapsed >= SPEECH_DURATION_MS) {

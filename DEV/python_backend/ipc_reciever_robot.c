@@ -42,7 +42,7 @@
 #define DEADBAND            0.08f
 #define KP_PAN             14.0f
 #define KD_PAN              1.2f
-#define KP_TILT            12.0f
+#define KP_TILT            11.0f
 #define KD_TILT             1.0f
 #define PAN_STEP_MAX        3.0f
 #define TILT_STEP_MAX       2.5f
