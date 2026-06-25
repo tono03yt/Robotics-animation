@@ -45,12 +45,12 @@ static struct timespec last_ts = {0};
 #define TILT_MAX 105.0f
 
 #define KP_X 15.0f
-#define KI_X 0.8f
+#define KI_X 0f
 #define KD_X 0.1f
 
 
-#define KP_Y 15.0f
-#define KI_Y 0.6f
+#define KP_Y 10.0f
+#define KI_Y 0f
 #define KD_Y 0.1f
 
 #define INTEGRAL_LIMIT_X 20.0f
@@ -59,8 +59,8 @@ static struct timespec last_ts = {0};
 #define deadzone_x 0.1f
 #define deadzone_y 0.1f
 
-#define direction_x 1.0f
-#define direction_y -1.0f
+#define direction_x -1.0f
+#define direction_y 1.0f
 
 static void cleanup(void) {
     if (arduino_fd >= 0) {

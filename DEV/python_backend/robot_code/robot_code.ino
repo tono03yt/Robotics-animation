@@ -1,34 +1,13 @@
 /*
- * ==============================================================================
- * Flashing Instructions (Linux Command Line using arduino-cli)
- * For Arduino Nano 33 IoT
- * ==============================================================================
- * 1. Install arduino-cli if you haven't already:
- *    curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
- * 
- * 2. Install the SAMD core (required for the Nano 33 IoT):
- *    arduino-cli core install arduino:samd
- * 
- * 3. Find your Arduino's port:
- *    arduino-cli board list
- *    (Look for something like /dev/ttyACM0 and arduino:samd:nano_33_iot)
- * 
- * 4. Compile the sketch:
- *    arduino-cli compile --fqbn arduino:samd:nano_33_iot arduino_nano_33_iot.ino
- * 
- * 5. Upload the code to your Arduino:
- *    arduino-cli upload -p /dev/ttyACM0 --fqbn arduino:samd:nano_33_iot arduino_nano_33_iot.ino
- * ==============================================================================
- * HARDWARE NOTE: 
- * The Arduino Nano 33 IoT uses 3.3V logic pins, unlike the 5V Arduino Uno. 
- * Most 5V servos will still register a 3.3V PWM control signal from pins 9 & 10 
- * without issues. However, you MUST power the servos from an external 5V power 
- * supply. Do not power the servos directly from the Nano's 3.3V or VUSB pin to 
- * avoid browning out or damaging the board.
- * ==============================================================================
- */
+* ==============================================================================
+* Flashing Instructions (Linux Command Line using arduino-cli)
+* For Arduino Nano 33 IoT
 
-#include <Arduino.h>
+ arduino-cli compile --upload -p /dev/ttyACM0 --fqbn arduino:samd:nano_33_iot robot_code.ino
+
+* ==============================================================================
+*/
+
 #include <Servo.h>
 
 Servo panServo;
@@ -41,16 +20,6 @@ const int panPin = 9;
 const int tiltPin = 10;
 const int leftArmPin = 8;
 const int rightArmPin = 7;
-
-// Pan: Right/Left
-const int panMin = 60;
-const int panMax = 120;
-const int panCenter = 90;
-
-// Tilt: Up/Down
-const int tiltMin = 75;
-const int tiltMax = 105;
-const int tiltCenter = 90;
 
 // Arms: Left/Right
 const int leftArmCenter = 90;
@@ -76,8 +45,9 @@ void setup() {
   leftArmServo.attach(leftArmPin);
   rightArmServo.attach(rightArmPin);
 
-  panServo.write(panCenter);
-  tiltServo.write(tiltCenter);
+  // Initialize center positions
+  panServo.write(90);
+  tiltServo.write(90);
   leftArmServo.write(leftArmCenter);
   rightArmServo.write(rightArmCenter);
 
@@ -110,11 +80,12 @@ void recvWithEndMarker() {
 void loop() {
   recvWithEndMarker();
 
+  // Handle incoming serial commands
   if (newData) {
     if (strncmp(receivedChars, "anim", 4) == 0) {
       char *strtokIndx = strtok(receivedChars, ",");
       if (strtokIndx != NULL) {
-        strtokIndx = strtok(NULL, ","); 
+        strtokIndx = strtok(NULL, ",");
         if (strtokIndx != NULL) {
           if (strcmp(strtokIndx, "wave") == 0) {
             currentAnimationType = 1;
@@ -134,38 +105,37 @@ void loop() {
         strtokIndx = strtok(NULL, ",");
         if (strtokIndx != NULL) {
           int tiltVal = atoi(strtokIndx);
-
-          if (panVal >= panMin && panVal <= panMax) {
-            panServo.write(panVal);
-          }
-          if (tiltVal >= tiltMin && tiltVal <= tiltMax) {
-            tiltServo.write(tiltVal);
-          }
+          
+          // Removed pan and tilt min/max constraints 
+          panServo.write(panVal);
+          tiltServo.write(tiltVal);
         }
       }
     }
     newData = false;
   }
 
+  // Handle Animations outside of the newData check so it updates continuously
   if (armAnimationActive) {
     unsigned long elapsed = millis() - armAnimationStartTime;
     if (elapsed <= armAnimationDuration) {
-        float progress = (float)elapsed / armAnimationDuration;
-        float angleOffset = sin(progress * 2.0 * PI) * (armMovementRange / 2.0); 
+      float progress = (float)elapsed / armAnimationDuration;
+      float angleOffset = sin(progress * 2.0 * PI) * (armMovementRange / 2.0);
 
-        if (currentAnimationType == 1) {
-            // Wave: only move the right arm
-            rightArmServo.write(rightArmCenter + angleOffset);
-            leftArmServo.write(leftArmCenter); 
-        } else if (currentAnimationType == 2) {
-            // Speech: move both arms
-            leftArmServo.write(leftArmCenter + angleOffset);
-            rightArmServo.write(rightArmCenter - angleOffset); 
-        }
-    } else {
-        armAnimationActive = false;
+      if (currentAnimationType == 1) {
+        // Wave: only move the right arm
+        rightArmServo.write(rightArmCenter + angleOffset);
         leftArmServo.write(leftArmCenter);
-        rightArmServo.write(rightArmCenter);
+      } else if (currentAnimationType == 2) {
+        // Speech: move both arms
+        leftArmServo.write(leftArmCenter + angleOffset);
+        rightArmServo.write(rightArmCenter - angleOffset);
+      }
+    } else {
+      // Animation finished, reset arms
+      armAnimationActive = false;
+      leftArmServo.write(leftArmCenter);
+      rightArmServo.write(rightArmCenter);
     }
   }
 }
