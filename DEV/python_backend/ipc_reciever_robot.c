@@ -1,7 +1,7 @@
 /*
  * ==============================================================================
  * IPC Receiver & Robot Controller
- * Pure PD Refactor + Soft Deadband + Float Servo Targets
+ * PID Refactor + Soft Deadband + Float Servo Targets
  * ==============================================================================
  */
 
@@ -38,15 +38,23 @@
 #define TILT_MIN     45.0f
 #define TILT_MAX     135.0f
 
-/* Pure PD Controller Settings */
-#define DEADBAND            0.08f
-#define KP_PAN             14.0f
-#define KD_PAN              1.2f
-#define KP_TILT            11.0f
-#define KD_TILT             1.0f
-#define PAN_STEP_MAX        3.0f
-#define TILT_STEP_MAX       2.5f
-#define CENTER_RETURN_ALPHA 0.08f
+/* PID Controller Settings */
+#define DEADBAND             0.08f
+
+#define KP_PAN              12.0f
+#define KI_PAN               0.035f
+#define KD_PAN               1.3f
+
+#define KP_TILT             11.0f
+#define KI_TILT              0.035f
+#define KD_TILT              1.5f
+
+#define PAN_INTEGRAL_MAX     2.0f
+#define TILT_INTEGRAL_MAX    2.0f
+
+#define PAN_STEP_MAX         3.0f
+#define TILT_STEP_MAX        2.5f
+#define CENTER_RETURN_ALPHA  0.08f
 
 /* Rate limiting */
 #define SERIAL_UPDATE_INTERVAL 0.02f   /* 50 Hz */
@@ -67,6 +75,8 @@ static float pan_angle = PAN_CENTER;
 static float tilt_angle = TILT_CENTER;
 static float last_x_error = 0.0f;
 static float last_y_error = 0.0f;
+static float pan_integral = 0.0f;
+static float tilt_integral = 0.0f;
 
 /* ==============================================================================
  * System & Cleanup Functions
@@ -218,6 +228,8 @@ static void handle_pos(float x, float y, float conf) {
     if (conf < 0.5f) {
         last_x_error = 0.0f;
         last_y_error = 0.0f;
+        pan_integral = 0.0f;
+        tilt_integral = 0.0f;
 
         pan_angle  += (PAN_CENTER  - pan_angle)  * CENTER_RETURN_ALPHA;
         tilt_angle += (TILT_CENTER - tilt_angle) * CENTER_RETURN_ALPHA;
@@ -225,14 +237,34 @@ static void handle_pos(float x, float y, float conf) {
         float pan_error = apply_soft_deadband(x, DEADBAND);
         float tilt_error = apply_soft_deadband(y, DEADBAND);
 
+        pan_integral += pan_error * dt;
+        tilt_integral += tilt_error * dt;
+
+        pan_integral = clampf(pan_integral, -PAN_INTEGRAL_MAX, PAN_INTEGRAL_MAX);
+        tilt_integral = clampf(tilt_integral, -TILT_INTEGRAL_MAX, TILT_INTEGRAL_MAX);
+
         float pan_derivative = (pan_error - last_x_error) / dt;
         float tilt_derivative = (tilt_error - last_y_error) / dt;
 
-        float pan_output = KP_PAN * pan_error + KD_PAN * pan_derivative;
-        float tilt_output = KP_TILT * tilt_error + KD_TILT * tilt_derivative;
+        float pan_output_raw =
+            KP_PAN * pan_error +
+            KI_PAN * pan_integral +
+            KD_PAN * pan_derivative;
 
-        pan_output = clampf(pan_output, -PAN_STEP_MAX, PAN_STEP_MAX);
-        tilt_output = clampf(tilt_output, -TILT_STEP_MAX, TILT_STEP_MAX);
+        float tilt_output_raw =
+            KP_TILT * tilt_error +
+            KI_TILT * tilt_integral +
+            KD_TILT * tilt_derivative;
+
+        float pan_output = clampf(pan_output_raw, -PAN_STEP_MAX, PAN_STEP_MAX);
+        float tilt_output = clampf(tilt_output_raw, -TILT_STEP_MAX, TILT_STEP_MAX);
+
+        if (pan_output != pan_output_raw) {
+            pan_integral -= pan_error * dt;
+        }
+        if (tilt_output != tilt_output_raw) {
+            tilt_integral -= tilt_error * dt;
+        }
 
         pan_angle += pan_output;
         tilt_angle -= tilt_output;
