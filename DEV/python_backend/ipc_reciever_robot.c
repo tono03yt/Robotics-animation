@@ -225,7 +225,7 @@ static void handle_pos(float x, float y, float conf) {
 
     float dt = get_dt_seconds();
 
-    if (conf < 0.5f) {
+    if (conf < 0.65f) {
         last_x_error = 0.0f;
         last_y_error = 0.0f;
         pan_integral = 0.0f;
@@ -285,11 +285,16 @@ static void handle_anim(const char *animation, const char *text) {
     ensure_serial_connection();
     if (arduino_fd >= 0) {
         char cmd[128];
-        snprintf(cmd, sizeof(cmd), "anim,%s\n", animation);
+        // Füge einen expliziten Zeilenumbruch hinzu, da Arduino auf '\n' wartet
+        snprintf(cmd, sizeof(cmd), "anim,%s\n", animation); 
+        
         if (write(arduino_fd, cmd, strlen(cmd)) < 0) {
-            printf("[Serial] Connection lost during animation. Attempting to reconnect to %s...\n", saved_port);
+            printf("[Serial] Connection lost during animation. Attempting to reconnect...\n");
             close(arduino_fd);
             arduino_fd = -1;
+        } else {
+            // Verhindere, dass der nächste POS-Befehl den Puffer sofort flutet
+            usleep(50000); // 50ms Pause
         }
     }
 }

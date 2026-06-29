@@ -379,7 +379,7 @@ def parse_llm_response_as_json(text: str) -> Optional[dict]:
             return None
         anim = data.get("animation")
         txt  = data.get("text")
-        if anim not in ("speech", "waving"):
+        if anim not in ("speech", "wave"):
             return None
         if not isinstance(txt, str):
             return None
@@ -392,7 +392,7 @@ def parse_llm_response_as_json(text: str) -> Optional[dict]:
 _SYSTEM_PROMPT = (
     'You are an assistant that MUST respond with a single, valid JSON object and NOTHING else. Do ONLY RESPOND IN GERMAN\n'
     'The JSON must have exactly two fields:\n'
-    '  - "animation": either "speech" or "waving"\n'
+    '  - "animation": either "speech" or "wave"\n'
     '  - "text": your reply as a string\n'
     'Return ONLY the JSON object. No markdown, no explanation.'
 )

@@ -55,7 +55,7 @@ enum AnimationType {
 bool animationActive = false;
 AnimationType currentAnimation = ANIM_NONE;
 unsigned long animationStartMs = 0;
-const unsigned long WAVE_DURATION_MS = 1000;
+const unsigned long WAVE_DURATION_MS = 2000;
 const unsigned long SPEECH_DURATION_MS = 1200;
 
 static void initServoState(
@@ -153,7 +153,7 @@ static void updateAnimationTargets() {
     }
 
     float t = (float)elapsed / (float)WAVE_DURATION_MS;
-    float wave = 18.0f * sinf(t * 4.0f * PI);
+    float wave = 28.0f * sinf(t * 4.0f * PI);
 
     leftArmAxis.targetDeg = LEFT_ARM_CENTER;
     rightArmAxis.targetDeg = clampf(RIGHT_ARM_CENTER + wave, 70.0f, 110.0f);
